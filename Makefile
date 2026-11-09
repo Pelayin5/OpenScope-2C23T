@@ -89,7 +89,7 @@ HOST_TEST_BINS := $(BUILD_ROOT)/tests/bootloader-old $(BUILD_ROOT)/tests/bootloa
                   $(BUILD_ROOT)/tests/generator-old $(BUILD_ROOT)/tests/generator-hw4 \
                   $(BUILD_ROOT)/tests/fpga_timing-old $(BUILD_ROOT)/tests/fpga_timing-hw4 \
                   $(BUILD_ROOT)/tests/fpga_timing-open $(BUILD_ROOT)/tests/generator-open \
-                  $(BUILD_ROOT)/tests/scope_hw_trigger-hw4
+                  $(BUILD_ROOT)/tests/scope_hw_trigger-hw4 $(BUILD_ROOT)/tests/scope_hw_status-hw4
 
 .PHONY: all clean clean-dist release release-lt-hw4 release-hw4 test
 
@@ -116,6 +116,7 @@ test: $(HOST_TEST_BINS)
 	$(BUILD_ROOT)/tests/fpga_timing-open
 	$(BUILD_ROOT)/tests/generator-open
 	$(BUILD_ROOT)/tests/scope_hw_trigger-hw4
+	$(BUILD_ROOT)/tests/scope_hw_status-hw4
 
 $(BUILD_ROOT)/tests/bootloader-old $(BUILD_ROOT)/tests/bootloader-hw4: tests/bootloader.c src/bootloader.c src/bootloader.h src/app_config.h
 	@mkdir -p $(dir $@)
@@ -136,6 +137,10 @@ $(BUILD_ROOT)/tests/fpga_timing-old $(BUILD_ROOT)/tests/fpga_timing-hw4: tests/f
 $(BUILD_ROOT)/tests/scope_hw_trigger-hw4: tests/scope_hw_trigger.c src/ui.c src/scope.h src/fpga.h
 	@mkdir -p $(dir $@)
 	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 -DFPGA_HW_TRIGGER=1 $< $(HOST_TEST_LINK) -o $@
+
+$(BUILD_ROOT)/tests/scope_hw_status-hw4: tests/scope_hw_status.c src/scope.c src/scope.h src/fpga.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 -DFPGA_HW_TRIGGER=1 -DSCOPE_HW_CAPTURE=1 $< $(HOST_TEST_LINK) -o $@
 
 $(BUILD_ROOT)/tests/scope_measurements-open: tests/scope_measurements.c src/ui.c src/scope.h src/fpga.h
 	@mkdir -p $(dir $@)

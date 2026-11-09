@@ -55,6 +55,7 @@ enum {
 
 static volatile uint8_t fpga_hw4_capture_ready_seen;
 static uint8_t fpga_hw4_trigger_tail[FPGA_TRIGGER_TAIL_BYTES] = {0, 1, 2, 3, 4, 5, 6, 7};
+static uint8_t fpga_hw4_trigger_ext[FPGA_TRIGGER_EXT_BYTES];
 static fpga_bus_test_t fpga_hw4_bus_test;
 
 static void fpga_hw4_short_delay(void) {
@@ -184,6 +185,13 @@ static void fpga_hw4_write_timing_frame(uint32_t tuning_word, uint32_t span) {
 
     for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) {
         fpga_hw4_parallel_write_byte(fpga_hw4_trigger_tail[i]);
+    }
+    // Extended frame: the open bitstream re-arms after the last extension byte.
+    if (fpga_hw4_trigger_tail[0] == FPGA_TRIGGER_MAGIC &&
+        (fpga_hw4_trigger_tail[1] & FPGA_TRIGGER_EXTENDED)) {
+        for (uint8_t i = 0; i < FPGA_TRIGGER_EXT_BYTES; ++i) {
+            fpga_hw4_parallel_write_byte(fpga_hw4_trigger_ext[i]);
+        }
     }
 
     fpga_hw4_bus_input();
@@ -326,6 +334,13 @@ void fpga_set_trigger_tail(const uint8_t *tail) {
     }
 }
 
+// Extension bytes of extended frames (tail byte 9 bit 7). NULL clears them.
+void fpga_set_trigger_ext(const uint8_t *ext) {
+    for (uint8_t i = 0; i < FPGA_TRIGGER_EXT_BYTES; ++i) {
+        fpga_hw4_trigger_ext[i] = ext ? ext[i] : 0u;
+    }
+}
+
 // Every data line at 0 and 1; byte 0 is not the trigger magic, so the capture stays free-running.
 static const uint8_t fpga_hw4_bus_test_tail[FPGA_TRIGGER_TAIL_BYTES] = {
     0x80u, 0x7Fu, 0xAAu, 0x55u, 0xFFu, 0x00u, 0xC3u, 0x3Cu,
@@ -392,6 +407,39 @@ uint8_t fpga_read_trigger_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES]) {
     gpio_clear(GPIOA_BASE, FPGA_HW4_SELECT_PIN);
     gpio_clear(GPIOB_BASE, FPGA_HW4_MOSI_PIN);
     return status[0] == FPGA_TRIGGER_STATUS_ID && status[6] == FPGA_TRIGGER_STATUS_VERSION ? 1u : 0u;
+}
+
+// Register read-back up to the extended status. Bit 0: trigger status valid, bit 1: extended
+// status valid (bitstreams without it return frame bytes there).
+uint8_t fpga_read_ext_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES],
+                             uint8_t ext_status[FPGA_EXT_STATUS_BYTES]) {
+    uint8_t valid = 0;
+
+    if (!status || !ext_status) {
+        return 0;
+    }
+
+    gpio_clear(GPIOB_BASE, FPGA_HW4_MOSI_PIN);
+    gpio_set(GPIOA_BASE, FPGA_HW4_SELECT_PIN);
+    fpga_hw4_bus_input();
+    for (uint8_t i = 0; i < 16u; ++i) {
+        (void)fpga_hw4_parallel_read_byte();
+    }
+    for (uint8_t i = 0; i < FPGA_TRIGGER_STATUS_BYTES; ++i) {
+        status[i] = fpga_hw4_parallel_read_byte();
+    }
+    for (uint8_t i = 0; i < FPGA_EXT_STATUS_BYTES; ++i) {
+        ext_status[i] = fpga_hw4_parallel_read_byte();
+    }
+    gpio_clear(GPIOA_BASE, FPGA_HW4_SELECT_PIN);
+    gpio_clear(GPIOB_BASE, FPGA_HW4_MOSI_PIN);
+    if (status[0] == FPGA_TRIGGER_STATUS_ID && status[6] == FPGA_TRIGGER_STATUS_VERSION) {
+        valid |= 1u;
+        if (ext_status[0] == FPGA_EXT_STATUS_VERSION) {
+            valid |= 2u;
+        }
+    }
+    return valid;
 }
 
 #else
@@ -607,6 +655,17 @@ void fpga_set_trigger_tail(const uint8_t *tail) {
 
 uint8_t fpga_read_trigger_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES]) {
     (void)status;
+    return 0;
+}
+
+void fpga_set_trigger_ext(const uint8_t *ext) {
+    (void)ext;
+}
+
+uint8_t fpga_read_ext_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES],
+                             uint8_t ext_status[FPGA_EXT_STATUS_BYTES]) {
+    (void)status;
+    (void)ext_status;
     return 0;
 }
 

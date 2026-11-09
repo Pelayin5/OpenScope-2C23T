@@ -233,7 +233,9 @@ typedef struct {
     int16_t amp;
     int16_t min_y;
     int16_t max_y;
+    uint8_t band;
     int16_t y[SCOPE_TRACE_MAX_POINTS];
+    int16_t y2[SCOPE_TRACE_MAX_POINTS]; // band: bottom edge (y is the top edge)
 } scope_trace_cache_t;
 
 static ui_state_t ui = {
@@ -293,6 +295,10 @@ static uint8_t arb_samples[2048];
 static uint8_t scope_samples[SCOPE_SAMPLE_BYTES] __attribute__((aligned(4)));
 static uint8_t scope_capture_samples[SCOPE_SAMPLE_BYTES] __attribute__((aligned(4)));
 static uint8_t scope_frame_valid;
+// Peak detect (open HW4 bitstream): the selected acquisition, and whether the shown frame is a
+// peak capture (pair 2k = group minimum, pair 2k+1 = group maximum).
+static uint8_t scope_acquisition;
+static uint8_t scope_capture_peak;
 static uint16_t scope_frame_id;
 static uint8_t scope_min_raw[2];
 static uint8_t scope_max_raw[2];
@@ -349,6 +355,7 @@ enum {
 static uint8_t scope_fpga_diag_active;
 static uint16_t scope_fpga_diag_ms;
 static uint8_t scope_fpga_diag_live[FPGA_TRIGGER_STATUS_BYTES];
+static uint8_t scope_fpga_diag_live_ext[FPGA_EXT_STATUS_BYTES];
 static uint8_t scope_fpga_diag_live_ok;
 #endif
 static uint8_t scope_roll_trigger_pending;
@@ -4302,6 +4309,18 @@ static void scope_measure_history_store(uint8_t min0,
     }
 }
 
+// Sample used by the averaging measurements (mean, RMS, frequency): in a peak capture the
+// middle of the group's minimum and maximum, otherwise the sample itself. VPP/VMAX/VMIN use
+// every stored value, so in a peak capture they include the peaks between samples.
+static uint8_t scope_measure_sample(uint16_t i, uint8_t ch) {
+    if (scope_capture_peak) {
+        uint16_t g = (uint16_t)(i & ~1u);
+        return (uint8_t)(((uint16_t)scope_samples[(uint16_t)(g * 2u + ch)] +
+                          (uint16_t)scope_samples[(uint16_t)(g * 2u + 2u + ch)] + 1u) / 2u);
+    }
+    return scope_samples[(uint16_t)(i * 2u + ch)];
+}
+
 static void scope_compute_stats(void) {
     uint32_t sum0 = 0;
     uint32_t sum1 = 0;
@@ -4340,6 +4359,8 @@ static void scope_compute_stats(void) {
         if (s1 > max1) {
             max1 = s1;
         }
+        s0 = scope_measure_sample(i, 0);
+        s1 = scope_measure_sample(i, 1);
         sum0 += s0;
         sum1 += s1;
         int16_t d0 = (int16_t)s0 - 128;
@@ -4636,6 +4657,23 @@ static uint8_t scope_trigger_accepts_capture(uint8_t found) {
     return found;
 }
 
+#if FPGA_HW_TRIGGER
+// Peak detect only where it means something: decimated captures in Y-T without FFT or math
+// (those work per sample). At the undecimated span every sample is already kept.
+static uint8_t scope_peak_possible(void) {
+    return ui.scope_display == SCOPE_DISPLAY_YT &&
+           !scope_slow_roll_active() &&
+           !scope_auto_zero_active &&
+           !scope_fft_src &&
+           !scope_math_mode &&
+           scope_hw_span_for_unit_ns(scope_timebase_unit_ns_value()) < SCOPE_HW_SPAN_MAX;
+}
+
+static uint8_t scope_peak_active(void) {
+    return scope_acquisition == SCOPE_HW_ACQ_PEAK && scope_peak_possible();
+}
+#endif
+
 // Hardware trigger (open HW4 bitstream): the trigger sample lands at the window position the
 // software trigger would use, so the same capture window logic applies.
 static void scope_hw_trigger_sync(void) {
@@ -4645,20 +4683,24 @@ static void scope_hw_trigger_sync(void) {
     uint16_t pre = (uint16_t)(scope_trigger_screen_sample_pos() +
                               (SCOPE_SAMPLE_COUNT - scope_visible_sample_count()) / 2u);
 
+    scope_hw_trigger_t trigger;
+
     if (ui.scope_trigger_mode == SCOPE_TRIGGER_NORMAL) {
         mode = SCOPE_HW_TRIGGER_NORMAL;
     } else if (ui.scope_trigger_mode == SCOPE_TRIGGER_SINGLE) {
         mode = SCOPE_HW_TRIGGER_SINGLE;
     }
-    scope_hw_set_trigger(!scope_auto_zero_active &&
-                             !scope_slow_roll_active() &&
-                             ui.scope_display == SCOPE_DISPLAY_YT &&
-                             scope_ch_enabled[src],
-                         mode,
-                         src,
-                         ui.scope_trigger_edge,
-                         ui.scope_trigger_level,
-                         pre);
+    trigger.enabled = !scope_auto_zero_active &&
+                      !scope_slow_roll_active() &&
+                      ui.scope_display == SCOPE_DISPLAY_YT &&
+                      scope_ch_enabled[src];
+    trigger.mode = mode;
+    trigger.source = src;
+    trigger.falling = ui.scope_trigger_edge;
+    trigger.level = ui.scope_trigger_level;
+    trigger.pre_samples = pre;
+    trigger.acquisition = scope_peak_active() ? SCOPE_HW_ACQ_PEAK : SCOPE_HW_ACQ_NORMAL;
+    scope_hw_set_trigger(&trigger);
 #endif
 }
 
@@ -4803,7 +4845,12 @@ static uint8_t scope_poll_frame(void) {
         ui.scope_display == SCOPE_DISPLAY_YT &&
         scope_ch_enabled[scope_trigger_source_index()]) {
         trigger_found = scope_hw_trigger_offset(&trigger_offset);
+#if FPGA_HW_TRIGGER
+        // A peak capture alternates group minima and maxima: only the FPGA trigger applies.
+        if (!trigger_found && scope_hw_capture_acquisition() != SCOPE_HW_ACQ_PEAK) {
+#else
         if (!trigger_found) {
+#endif
             trigger_found = scope_find_trigger_offset(scope_capture_samples, &trigger_offset);
         }
     } else {
@@ -4813,6 +4860,11 @@ static uint8_t scope_poll_frame(void) {
         return 0;
     }
     scope_copy_capture_samples();
+#if FPGA_HW_TRIGGER
+    scope_capture_peak = scope_hw_capture_acquisition() == SCOPE_HW_ACQ_PEAK;
+#else
+    scope_capture_peak = 0;
+#endif
 
     scope_frame_valid = 1;
     ++scope_frame_id;
@@ -4914,6 +4966,37 @@ static uint8_t scope_display_sample_raw(uint16_t x, uint8_t ch, uint16_t width) 
         idx = (uint16_t)(scope_capture_window_start() + idx);
     }
     return scope_samples[(uint16_t)(idx * 2u + (ch ? 1u : 0u))];
+}
+
+// Peak capture: lowest and highest stored value of the pairs drawn at column x (up to the next
+// trace point), at least one group (two pairs) so both its minimum and maximum count.
+static void scope_band_raw(uint16_t x, uint8_t ch, uint16_t width, uint8_t *lo, uint8_t *hi) {
+    uint16_t visible_samples = scope_visible_sample_count();
+    uint16_t start = scope_capture_window_start();
+    uint16_t first = (uint16_t)((uint32_t)x * (visible_samples - 1u) / width);
+    uint16_t last = (uint16_t)((uint32_t)(x + SCOPE_TRACE_STEP) * (visible_samples - 1u) / width);
+    uint8_t vmin = 255;
+    uint8_t vmax = 0;
+
+    first = (uint16_t)((start + first) & ~1u);
+    last = (uint16_t)(start + last);
+    if (last < first + 2u) {
+        last = (uint16_t)(first + 2u);
+    }
+    if (last > SCOPE_SAMPLE_COUNT) {
+        last = SCOPE_SAMPLE_COUNT;
+    }
+    for (uint16_t i = first; i < last; ++i) {
+        uint8_t v = scope_samples[(uint16_t)(i * 2u + ch)];
+        if (v < vmin) {
+            vmin = v;
+        }
+        if (v > vmax) {
+            vmax = v;
+        }
+    }
+    *lo = vmin;
+    *hi = vmax;
 }
 
 static int16_t scope_sample_y(uint16_t x,
@@ -5339,9 +5422,9 @@ static uint32_t scope_estimate_freq_hz_window(uint8_t idx, uint16_t start, uint1
         return 0;
     }
     level = (uint8_t)(((uint16_t)min_raw + (uint16_t)max_raw) / 2u);
-    prev = scope_samples[(uint16_t)(start * 2u + idx)];
+    prev = scope_measure_sample(start, idx);
     for (uint16_t i = (uint16_t)(start + 1u); i < end; ++i) {
-        uint8_t cur = scope_samples[(uint16_t)(i * 2u + idx)];
+        uint8_t cur = scope_measure_sample(i, idx);
         if (prev <= level && cur > level) {
             if (!crossings) {
                 first = i;
@@ -5506,6 +5589,51 @@ static void scope_format_frequency_reading(char out[12], uint32_t hz) {
     out[n] = 0;
 }
 
+#if FPGA_HW_TRIGGER
+// Hardware counter reading (millihertz), four significant digits: 6.943HZ, 41.67KHZ,
+// 123.4KHZ, 1.000MHZ.
+static void scope_format_counter_reading(char out[12], uint64_t mhz) {
+    char number[11];
+    const char *unit = "HZ";
+    uint32_t unit_mhz = 1u;
+    uint32_t x;
+    uint32_t scale = 1000u;
+    uint8_t n;
+
+    if (mhz >= 1000000000u) {
+        unit = "MHZ";
+        unit_mhz = 1000000u;
+    } else if (mhz >= 1000000u) {
+        unit = "KHZ";
+        unit_mhz = 1000u;
+    }
+    x = (uint32_t)scope_hw_div_u64(mhz, unit_mhz);   // thousandths of the unit
+    if (x >= 100000u) {
+        x = (x + 50u) / 100u;
+        scale = 10u;
+    } else if (x >= 10000u) {
+        x = (x + 5u) / 10u;
+        scale = 100u;
+    }
+    if (scale > 10u && x >= scale * 100u) {
+        // rounding carried into the next decade (99.996 -> 100.0)
+        x /= 10u;
+        scale /= 10u;
+    }
+    scope_format_u32(number, x / scale);
+    scope_text_copy(out, number, 8);
+    n = scope_text_len(number);
+    out[n++] = '.';
+    for (uint32_t div = scale / 10u; div; div /= 10u) {
+        out[n++] = (char)('0' + (x / div) % 10u);
+    }
+    while (*unit && n < 11u) {
+        out[n++] = *unit++;
+    }
+    out[n] = 0;
+}
+#endif
+
 static void scope_measure_value_for(char out[12], uint8_t idx, uint8_t measure) {
     uint8_t min_raw;
     uint8_t max_raw;
@@ -5535,6 +5663,14 @@ static void scope_measure_value_for(char out[12], uint8_t idx, uint8_t measure) 
     } else if (measure == SCOPE_MEASURE_VRMS) {
         scope_format_measure_voltage(out, (int32_t)scope_rms_raw_mv(idx, scope_filtered_rms_raw(idx)));
     } else {
+#if FPGA_HW_TRIGGER
+        uint64_t mhz;
+        // The FPGA counter (trigger source channel) when it has a measurement.
+        if (scope_hw_counter_mhz(idx, &mhz)) {
+            scope_format_counter_reading(out, mhz);
+            return;
+        }
+#endif
         scope_format_frequency_reading(out, scope_filtered_freq_hz(idx));
     }
 }
@@ -6088,7 +6224,9 @@ static scope_trace_cache_t *scope_trace_prepare(uint8_t ch2,
                                                 int16_t min_y,
                                                 int16_t max_y) {
     scope_trace_cache_t *cache = &scope_trace_cache[ch2 ? 1u : 0u];
+    uint8_t band = scope_frame_valid && scope_capture_peak && ui.scope_display == SCOPE_DISPLAY_YT;
     if (cache->valid &&
+        cache->band == band &&
         cache->ch2 == ch2 &&
         cache->timebase == ui.scope_timebase &&
         cache->phase == ui.scope_phase &&
@@ -6104,13 +6242,22 @@ static scope_trace_cache_t *scope_trace_prepare(uint8_t ch2,
 
     uint8_t count = 0;
     for (uint16_t x = 0; x <= width && count < SCOPE_TRACE_MAX_POINTS; x = (uint16_t)(x + SCOPE_TRACE_STEP)) {
-        cache->y[count++] = scope_sample_y(x, ch2, center, amp, width, min_y, max_y);
+        if (band) {
+            uint8_t lo;
+            uint8_t hi;
+            scope_band_raw(x, ch2 ? 1u : 0u, width, &lo, &hi);
+            cache->y[count] = scope_scaled_sample_y(ch2 ? 1u : 0u, hi, center, amp, min_y, max_y);
+            cache->y2[count++] = scope_scaled_sample_y(ch2 ? 1u : 0u, lo, center, amp, min_y, max_y);
+        } else {
+            cache->y[count++] = scope_sample_y(x, ch2, center, amp, width, min_y, max_y);
+        }
         if ((uint16_t)(x + SCOPE_TRACE_STEP) < x) {
             break;
         }
     }
 
     cache->valid = 1;
+    cache->band = band;
     cache->ch2 = ch2;
     cache->timebase = ui.scope_timebase;
     cache->count = count;
@@ -6213,6 +6360,21 @@ static void draw_scope_trace(uint16_t color,
         return; 
     }
 
+    if (trace->band) {
+        // Peak capture: filled min/max band, each column spans its neighbour so the band
+        // stays closed.
+        uint16_t px = 0;
+        for (uint8_t point = 0; point < trace->count; ++point, px = (uint16_t)(px + SCOPE_TRACE_STEP)) {
+            uint8_t next = (uint8_t)(point + 1u < trace->count ? point + 1u : point);
+            int16_t top = trace->y[point] < trace->y[next] ? trace->y[point] : trace->y[next];
+            int16_t bottom = trace->y2[point] > trace->y2[next] ? trace->y2[point] : trace->y2[next];
+            uint16_t w = point + 1u < trace->count ? SCOPE_TRACE_STEP : 1u;
+
+            lcd_rect((uint16_t)(x0 + px), (uint16_t)top, w, (uint16_t)(bottom - top + 1), color);
+        }
+        return;
+    }
+
     int16_t prev_x = x0;
     int16_t prev_y = trace->y[0];
     uint16_t i = SCOPE_TRACE_STEP;
@@ -6227,6 +6389,95 @@ static void draw_scope_trace(uint16_t color,
         prev_y = y;
     }
 }
+
+#if FPGA_HW_TRIGGER
+static void ui_render_local_change(void);
+static void capture_screenshot_now(void);
+
+// Acquisition / trigger setup (CH2 long press in scope mode), drawn like the math menu.
+enum {
+    SCOPE_SETUP_ACQUIRE,
+    SCOPE_SETUP_ROWS,
+};
+static uint8_t scope_setup_menu_visible;
+static uint8_t scope_setup_selected;
+static const char *const scope_acquisition_labels[] = {"NORMAL", "PEAK DETECT"};
+
+static void ui_draw_scope_setup_menu(void) {
+    uint16_t box_x = 50;
+    uint16_t box_y = 60;
+    uint16_t box_w = 220;
+    uint16_t box_bg = RGB565(30, 30, 45);
+    uint16_t box_h = (uint16_t)(36u + SCOPE_SETUP_ROWS * 18u + 14u);
+    uint16_t row_y = (uint16_t)(box_y + 26u);
+    const char *note = "";
+
+    if (!scope_setup_menu_visible) {
+        return;
+    }
+    lcd_rect(box_x, box_y, box_w, box_h, box_bg);
+    lcd_frame(box_x, box_y, box_w, box_h, RGB565(255, 165, 0));
+    lcd_text((uint16_t)(box_x + 10u), (uint16_t)(box_y + 8u), "ACQUIRE / TRIGGER", RGB565(255, 255, 255), box_bg, 1);
+    lcd_rect((uint16_t)(box_x + 10u), (uint16_t)(box_y + 20u), (uint16_t)(box_w - 20u), 1, RGB565(100, 100, 100));
+    for (uint8_t row = 0; row < SCOPE_SETUP_ROWS; ++row) {
+        uint16_t bg = scope_setup_selected == row ? RGB565(0, 120, 240) : box_bg;
+        uint16_t fg = RGB565(255, 255, 255);
+        const char *label = "";
+        const char *value = "";
+
+        if (row == SCOPE_SETUP_ACQUIRE) {
+            label = "ACQUIRE:";
+            value = scope_acquisition_labels[scope_acquisition ? 1u : 0u];
+            if (scope_acquisition && !scope_peak_possible()) {
+                fg = RGB565(120, 120, 120);
+                note = "PEAK: Y-T, 2US/DIV AND SLOWER";
+            }
+        }
+        lcd_rect((uint16_t)(box_x + 8u), row_y, (uint16_t)(box_w - 16u), 14, bg);
+        lcd_text((uint16_t)(box_x + 12u), (uint16_t)(row_y + 3u), label, fg, bg, 1);
+        lcd_text((uint16_t)(box_x + 110u), (uint16_t)(row_y + 3u), value, fg, bg, 1);
+        row_y = (uint16_t)(row_y + 18u);
+    }
+    lcd_text((uint16_t)(box_x + 12u), (uint16_t)(row_y + 2u), note, RGB565(160, 160, 160), box_bg, 1);
+}
+
+static void scope_setup_adjust(int8_t dir) {
+    (void)dir;
+    if (scope_setup_selected == SCOPE_SETUP_ACQUIRE) {
+        scope_acquisition = scope_acquisition ? SCOPE_HW_ACQ_NORMAL : SCOPE_HW_ACQ_PEAK;
+        scope_trigger_locked = 0;
+        scope_trace_invalidate();
+    }
+}
+
+static uint8_t ui_handle_keys_scope_setup_menu(uint32_t events) {
+    if (!scope_setup_menu_visible) {
+        return 0;
+    }
+    if (ui.mode != UI_MODE_SCOPE || ui.overlay != UI_OVERLAY_NONE) {
+        scope_setup_menu_visible = 0;
+        return 0;
+    }
+    if (events & KEY_SAVE_LONG) {
+        capture_screenshot_now();
+        return 1;
+    }
+    if (events & (KEY_MENU | KEY_CH2_LONG)) {
+        scope_setup_menu_visible = 0;
+    } else if (events & KEY_UP) {
+        scope_setup_selected = scope_setup_selected ? (uint8_t)(scope_setup_selected - 1u) :
+                                                      (uint8_t)(SCOPE_SETUP_ROWS - 1u);
+    } else if (events & KEY_DOWN) {
+        scope_setup_selected = (uint8_t)((scope_setup_selected + 1u) % SCOPE_SETUP_ROWS);
+    } else if (events & (KEY_LEFT | KEY_RIGHT | KEY_OK)) {
+        scope_setup_adjust((events & KEY_LEFT) ? -1 : 1);
+    } else {
+        return 1;
+    }
+    ui_render_local_change();
+    return 1;
+}
+#endif
 
 static void draw_scope_chrome_live(void) {
     uint16_t gx = 10;
@@ -6466,12 +6717,18 @@ static void draw_scope_immersive(void) {
         draw_scope_cursor_readout(gx, gy, gw, gh, grid_bg);
         draw_scope_hpos_indicator(gx, gy, gw, gh, grid_bg);
         draw_scope_measure_readout((uint16_t)(gx + 6u), gy, (uint16_t)(gw - 12u), gh, grid_bg);
+        if (scope_capture_peak && ui.scope_display == SCOPE_DISPLAY_YT) {
+            lcd_text_transparent((uint16_t)(gx + gw - 28u), (uint16_t)(gy + gh - 10u), "PEAK", C_WARN, 1);
+        }
     } else {
         lcd_text_center(gx, (uint16_t)(gy + 82u), gw, scope_hw_ready() ? "WAIT" : "FPGA", C_MUTED, grid_bg, 2);
     }
 
     draw_scope_scale_status(220, grid_bg);
     ui_draw_math_menu();
+#if FPGA_HW_TRIGGER
+    ui_draw_scope_setup_menu();
+#endif
 }
 
 static uint8_t gen_clamped_duty(void) {
@@ -7509,7 +7766,7 @@ static void draw_scope_fpga_diag_box(uint16_t x, uint16_t y) {
     static const char *const scope_status_names[] = {"IDLE", "NOFPGA", "WAIT", "READERR", "FRAME"};
     const uint16_t box_bg = RGB565(0, 0, 0);
     const uint16_t w = 300;
-    const uint16_t h = 104;
+    const uint16_t h = 114;
     const uint16_t tx = (uint16_t)(x + 3u);
     const fpga_bus_test_t *bt = fpga_bus_test_result();
     uint16_t ly = (uint16_t)(y + 2u);
@@ -7556,7 +7813,7 @@ static void draw_scope_fpga_diag_box(uint16_t x, uint16_t y) {
 
     // 5-6: live status (register read-back every 250 ms)
     p = scope_diag_put(line, "LIVE");
-    if (scope_fpga_diag_live_ok) {
+    if (scope_fpga_diag_live_ok & 1u) {
         p = scope_diag_put_status(p, scope_fpga_diag_live);
     } else {
         p = scope_diag_put(p, " ID:");
@@ -7565,7 +7822,7 @@ static void draw_scope_fpga_diag_box(uint16_t x, uint16_t y) {
         p = scope_diag_put_hex(p, scope_fpga_diag_live[6], 2);
         p = scope_diag_put(p, " (NO STATUS)");
     }
-    lcd_text(tx, ly, line, scope_fpga_diag_live_ok ? C_CH1 : C_WARN, box_bg, 1);
+    lcd_text(tx, ly, line, (scope_fpga_diag_live_ok & 1u) ? C_CH1 : C_WARN, box_bg, 1);
     ly = (uint16_t)(ly + 10u);
     p = scope_diag_put(line, "CTL:");
     p = scope_diag_put_hex(p, scope_fpga_diag_live[7], 2);
@@ -7591,7 +7848,28 @@ static void draw_scope_fpga_diag_box(uint16_t x, uint16_t y) {
     lcd_text(tx, ly, line, C_TEXT, box_bg, 1);
     ly = (uint16_t)(ly + 10u);
 
-    // 8: capture counters
+    // 8: extended status (live): features, acquisition, frequency counter flags, E, T
+    p = scope_diag_put(line, "EXT");
+    if (scope_fpga_diag_live_ok & 2u) {
+        const uint8_t *xs = scope_fpga_diag_live_ext;
+        p = scope_diag_put(p, " FEAT:");
+        p = scope_diag_put_hex(p, xs[FPGA_EXT_STATUS_FEATURES], 2);
+        p = scope_diag_put(p, " ACQ:");
+        p = scope_diag_put_u32(p, xs[FPGA_EXT_STATUS_ACQ]);
+        p = scope_diag_put(p, " CNT:");
+        p = scope_diag_put_hex(p, xs[FPGA_EXT_STATUS_COUNTER], 2);
+        p = scope_diag_put(p, " E:");
+        p = scope_diag_put_u32(p, ((uint32_t)xs[2] << 16) | ((uint32_t)xs[3] << 8) | xs[4]);
+        p = scope_diag_put(p, " T:");
+        p = scope_diag_put_u32(p, ((uint32_t)xs[5] << 24) | ((uint32_t)xs[6] << 16) |
+                                      ((uint32_t)xs[7] << 8) | xs[8]);
+    } else {
+        p = scope_diag_put(p, " -");
+    }
+    lcd_text(tx, ly, line, C_MUTED, box_bg, 1);
+    ly = (uint16_t)(ly + 10u);
+
+    // 9: capture counters
     p = scope_diag_put(line, "FRM:");
     p = scope_diag_put_u32(p, scope_hw_frame_count());
     p = scope_diag_put(p, " WAIT:");
@@ -10396,11 +10674,16 @@ static uint8_t scope_fpga_diag_handle_keys(uint32_t events) {
     if (ui.mode != UI_MODE_SCOPE || scope_any_menu_open() || ui_math_menu_visible) {
         return 0;
     }
+#if FPGA_HW_TRIGGER
+    if (scope_setup_menu_visible) {
+        return 0;
+    }
+#endif
     if (events & KEY_SAVE) {
         scope_fpga_diag_active = (uint8_t)!scope_fpga_diag_active;
         scope_fpga_diag_ms = 0;
         if (scope_fpga_diag_active) {
-            scope_fpga_diag_live_ok = fpga_read_trigger_status(scope_fpga_diag_live);
+            scope_fpga_diag_live_ok = fpga_read_ext_status(scope_fpga_diag_live, scope_fpga_diag_live_ext);
         }
         ui_render_local_change();
         return 1;
@@ -10427,6 +10710,20 @@ void ui_handle_keys(uint32_t events) {
     if (ui_math_menu_visible && ui_handle_keys_math_menu(events)) {
         return;
     }
+#if FPGA_HW_TRIGGER
+    if (ui_handle_keys_scope_setup_menu(events)) {
+        return;
+    }
+    if ((events & KEY_CH2_LONG) &&
+        ui.mode == UI_MODE_SCOPE &&
+        ui.overlay == UI_OVERLAY_NONE &&
+        !scope_any_menu_open() &&
+        !ui_math_menu_visible) {
+        scope_setup_menu_visible = 1;
+        ui_render_local_change();
+        return;
+    }
+#endif
 
     if (ui_math_menu_visible && (ui.mode != UI_MODE_SCOPE || ui.overlay != UI_OVERLAY_NONE)) {
         ui_math_menu_visible = 0;
@@ -11146,7 +11443,7 @@ void ui_tick(uint32_t elapsed_ms) {
         if (diag_next >= SCOPE_FPGA_DIAG_REFRESH_MS) {
             // Live status: also refreshes while a NORM/SINGLE capture waits for its trigger.
             scope_fpga_diag_ms = 0;
-            scope_fpga_diag_live_ok = fpga_read_trigger_status(scope_fpga_diag_live);
+            scope_fpga_diag_live_ok = fpga_read_ext_status(scope_fpga_diag_live, scope_fpga_diag_live_ext);
             if (!rendered) {
                 ui_render_scope_frame();
                 rendered = 1;

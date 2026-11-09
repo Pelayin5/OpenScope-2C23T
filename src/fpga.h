@@ -41,6 +41,26 @@ enum {
     FPGA_TRIGGER_STATUS_ENABLED = 1u << 3,
     FPGA_TRIGGER_STATUS_WAITING = 1u << 4,
     FPGA_TRIGGER_STATUS_HELD = 1u << 5,
+
+    // Byte 9 bit 7: extended frame, 8 more bytes after the tail (acquisition and trigger type).
+    FPGA_TRIGGER_EXTENDED = 1u << 7,
+    FPGA_TRIGGER_EXT_BYTES = 8,
+    FPGA_ACQ_NORMAL = 0,
+    FPGA_ACQ_PEAK = 1,
+
+    // Extended status: read-back bytes 24..39.
+    FPGA_EXT_STATUS_BYTES = 16,
+    FPGA_EXT_STATUS_VERSION = 0x02,
+    FPGA_EXT_STATUS_COUNTER = 1,   // flags, then E (3 bytes) and T (4 bytes), MSB first
+    FPGA_EXT_STATUS_FEATURES = 9,
+    FPGA_EXT_STATUS_ACQ = 10,
+    FPGA_FEATURE_PEAK = 1u << 0,
+    FPGA_FEATURE_COUNTER = 1u << 2,
+    // Frequency counter flags: E periods took T fast clocks (reciprocal, gate ~100 ms).
+    FPGA_COUNTER_VALID = 1u << 0,
+    FPGA_COUNTER_NO_SIGNAL = 1u << 1,
+    FPGA_COUNTER_RUNNING = 1u << 2,
+    FPGA_COUNTER_SOURCE_CH2 = 1u << 3,
 };
 
 void fpga_init_once(void);
@@ -55,7 +75,10 @@ void fpga_capture_ready_irq_handler(void);
 uint8_t fpga_capture_read(uint8_t *dst, uint16_t len);
 uint8_t fpga_capture_read_slow_point(uint8_t sample[2]);
 void fpga_set_trigger_tail(const uint8_t *tail);
+void fpga_set_trigger_ext(const uint8_t *ext);
 uint8_t fpga_read_trigger_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES]);
+uint8_t fpga_read_ext_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES],
+                             uint8_t ext_status[FPGA_EXT_STATUS_BYTES]);
 
 // Open HW4 bitstream: bus self-test through the frame read-back (all 8 data lines, both ways).
 enum {

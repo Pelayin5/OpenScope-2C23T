@@ -562,7 +562,7 @@ static uint32_t input_short_long_event(uint32_t now,
 
 uint32_t input_pressed_events(void) {
     enum {
-        SHORT_LONG_KEYS = KEY_MOVE | KEY_F2 | KEY_F3 | KEY_F4 | KEY_AUTO | KEY_SAVE | KEY_CH1,
+        SHORT_LONG_KEYS = KEY_MOVE | KEY_F2 | KEY_F3 | KEY_F4 | KEY_AUTO | KEY_SAVE | KEY_CH1 | KEY_CH2,
         STARTUP_GUARD_POLLS = 10,
     };
     static uint32_t last_keys;
@@ -591,6 +591,8 @@ uint32_t input_pressed_events(void) {
     static uint8_t save_long_sent;
     static uint16_t ch1_hold_ms;
     static uint8_t ch1_long_sent;
+    static uint16_t ch2_hold_ms;
+    static uint8_t ch2_long_sent;
     uint32_t now = input_debounced_keys();
     uint32_t events;
 
@@ -622,6 +624,7 @@ uint32_t input_pressed_events(void) {
     events &= ~KEY_AUTO;
     events &= ~KEY_SAVE;
     events &= ~KEY_CH1;
+    events &= ~KEY_CH2;
 
     events |= input_short_long_event(now, last_keys, KEY_MOVE, KEY_MOVE_LONG, &move_hold_ms, &move_long_sent);
     events |= input_short_long_event(now, last_keys, KEY_F2, KEY_F2_LONG, &f2_hold_ms, &f2_long_sent);
@@ -636,6 +639,7 @@ uint32_t input_pressed_events(void) {
     events |= input_repeat_event(now, last_keys, KEY_DOWN, &down_hold_ms, &down_repeat_ms);
 
     events |= input_short_long_event(now, last_keys, KEY_CH1, KEY_CH1_LONG, &ch1_hold_ms, &ch1_long_sent);
+    events |= input_short_long_event(now, last_keys, KEY_CH2, KEY_CH2_LONG, &ch2_hold_ms, &ch2_long_sent);
 
     last_keys = now;
     return events;

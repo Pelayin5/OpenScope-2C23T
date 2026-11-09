@@ -54,6 +54,12 @@ enum {
 };
 
 static uint8_t scope_trigger_tail[FPGA_TRIGGER_TAIL_BYTES] = {0, 1, 2, 3, 4, 5, 6, 7};
+static uint8_t scope_trigger_ext[FPGA_TRIGGER_EXT_BYTES];
+static uint8_t scope_trigger_ext_status[FPGA_EXT_STATUS_BYTES];
+static uint8_t scope_capture_acq;
+static uint8_t scope_counter_valid;
+static uint8_t scope_counter_channel;
+static uint64_t scope_counter_mhz;
 static uint8_t scope_trigger_seq;
 static uint8_t scope_trigger_dirty;
 static uint8_t scope_trigger_hit;
@@ -73,14 +79,42 @@ static void scope_trigger_next_seq(void) {
     fpga_set_trigger_tail(scope_trigger_tail);
 }
 
+// Frequency counter result (extended status): E periods in T fast clocks.
+static void scope_counter_read(const uint8_t *ext) {
+    const uint8_t *c;
+    uint32_t periods;
+    uint32_t clocks;
+
+    scope_counter_valid = 0;
+    if (!ext || !(ext[FPGA_EXT_STATUS_FEATURES] & FPGA_FEATURE_COUNTER)) {
+        return;
+    }
+    c = &ext[FPGA_EXT_STATUS_COUNTER];
+    periods = ((uint32_t)c[1] << 16) | ((uint32_t)c[2] << 8) | c[3];
+    clocks = ((uint32_t)c[4] << 24) | ((uint32_t)c[5] << 16) | ((uint32_t)c[6] << 8) | c[7];
+    if (!(c[0] & FPGA_COUNTER_VALID) || !periods || !clocks) {
+        return;
+    }
+    scope_counter_channel = (c[0] & FPGA_COUNTER_SOURCE_CH2) ? 1u : 0u;
+    scope_counter_mhz = scope_hw_div_u64((uint64_t)periods * FPGA_FAST_CLOCK_HZ * 1000u, clocks);
+    scope_counter_valid = 1;
+}
+
 static void scope_trigger_read_status(void) {
     uint8_t *status = scope_trigger_status;
     uint16_t rot;
     uint16_t entry;
     uint16_t base;
 
+    uint8_t valid;
+
     scope_trigger_hit = 0;
-    scope_trigger_status_valid = fpga_read_trigger_status(status);
+    valid = fpga_read_ext_status(status, scope_trigger_ext_status);
+    scope_trigger_status_valid = valid & 1u;
+    // The buffer format follows what the FPGA did (peak detect is refused at full rate).
+    scope_capture_acq = (valid & 2u) ? (uint8_t)(scope_trigger_ext_status[FPGA_EXT_STATUS_ACQ] & 3u) :
+                                        (uint8_t)FPGA_ACQ_NORMAL;
+    scope_counter_read((valid & 2u) ? scope_trigger_ext_status : 0);
     if (scope_trigger_tail[0] != FPGA_TRIGGER_MAGIC ||
         !scope_trigger_status_valid ||
         !(status[1] & FPGA_TRIGGER_STATUS_TRIGGERED)) {
@@ -671,12 +705,7 @@ uint8_t scope_hw_last_status(void) {
     return scope_last_status;
 }
 
-void scope_hw_set_trigger(uint8_t enabled,
-                          uint8_t mode,
-                          uint8_t source,
-                          uint8_t falling,
-                          uint8_t level,
-                          uint16_t pre_samples) {
+void scope_hw_set_trigger(const scope_hw_trigger_t *trigger) {
 #if FPGA_HW_TRIGGER && SCOPE_HW_CAPTURE
     static const uint8_t modes[] = {
         FPGA_TRIGGER_MODE_AUTO,
@@ -684,9 +713,20 @@ void scope_hw_set_trigger(uint8_t enabled,
         FPGA_TRIGGER_MODE_SINGLE,
     };
     uint8_t tail[FPGA_TRIGGER_TAIL_BYTES];
+    uint8_t ext[FPGA_TRIGGER_EXT_BYTES] = {0};
     uint8_t changed = 0;
+    uint8_t mode;
+    uint16_t pre_samples;
 
-    if (enabled) {
+    if (!trigger) {
+        return;
+    }
+    mode = trigger->mode;
+    pre_samples = trigger->pre_samples;
+    if (trigger->acquisition == SCOPE_HW_ACQ_PEAK) {
+        ext[0] = FPGA_ACQ_PEAK;
+    }
+    if (trigger->enabled) {
         if (mode >= (uint8_t)sizeof(modes)) {
             mode = SCOPE_HW_TRIGGER_AUTO;
         }
@@ -695,17 +735,35 @@ void scope_hw_set_trigger(uint8_t enabled,
         }
         tail[0] = FPGA_TRIGGER_MAGIC;
         tail[1] = (uint8_t)(modes[mode] |
-                            (source ? FPGA_TRIGGER_SOURCE_CH2 : 0u) |
-                            (falling ? FPGA_TRIGGER_EDGE_FALLING : 0u));
-        tail[2] = level;
+                            (trigger->source ? FPGA_TRIGGER_SOURCE_CH2 : 0u) |
+                            (trigger->falling ? FPGA_TRIGGER_EDGE_FALLING : 0u));
+        tail[2] = trigger->level;
         tail[3] = SCOPE_HW_TRIGGER_HYSTERESIS;
         tail[4] = (uint8_t)(pre_samples >> 8);
         tail[5] = (uint8_t)pre_samples;
         tail[6] = SCOPE_HW_TRIGGER_AUTO_TIMEOUT_MS;
         tail[7] = scope_trigger_seq;
+    } else if (ext[0]) {
+        // Peak detect without the hardware trigger: a forced capture (no comparator).
+        tail[0] = FPGA_TRIGGER_MAGIC;
+        tail[1] = FPGA_TRIGGER_MODE_FORCE;
+        tail[2] = 128u;
+        tail[3] = SCOPE_HW_TRIGGER_HYSTERESIS;
+        tail[4] = (uint8_t)(FPGA_SAMPLE_COUNT / 2u >> 8);
+        tail[5] = (uint8_t)(FPGA_SAMPLE_COUNT / 2u);
+        tail[6] = 0;
+        tail[7] = scope_trigger_seq;
     } else {
         for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) {
             tail[i] = i;
+        }
+    }
+    for (uint8_t i = 0; i < FPGA_TRIGGER_EXT_BYTES; ++i) {
+        if (ext[i]) {
+            tail[1] |= FPGA_TRIGGER_EXTENDED;
+        }
+        if (ext[i] != scope_trigger_ext[i]) {
+            changed = 1;
         }
     }
     for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES - 1u; ++i) {
@@ -716,22 +774,46 @@ void scope_hw_set_trigger(uint8_t enabled,
     if (!changed) {
         return;
     }
-    if (enabled) {
+    if (tail[0] == FPGA_TRIGGER_MAGIC) {
         tail[7] = ++scope_trigger_seq;
     }
     for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) {
         scope_trigger_tail[i] = tail[i];
     }
+    for (uint8_t i = 0; i < FPGA_TRIGGER_EXT_BYTES; ++i) {
+        scope_trigger_ext[i] = ext[i];
+    }
     fpga_set_trigger_tail(scope_trigger_tail);
+    fpga_set_trigger_ext(scope_trigger_ext);
     scope_trigger_dirty = 1;
     scope_trigger_hit = 0;
 #else
-    (void)enabled;
-    (void)mode;
-    (void)source;
-    (void)falling;
-    (void)level;
-    (void)pre_samples;
+    (void)trigger;
+#endif
+}
+
+// Hardware frequency counter of the last capture's status, in millihertz, for the channel it
+// counts (the trigger source). 0 when there is no valid measurement.
+uint8_t scope_hw_counter_mhz(uint8_t channel, uint64_t *mhz) {
+#if FPGA_HW_TRIGGER && SCOPE_HW_CAPTURE
+    if (!mhz || !scope_counter_valid || channel != scope_counter_channel) {
+        return 0;
+    }
+    *mhz = scope_counter_mhz;
+    return 1;
+#else
+    (void)channel;
+    (void)mhz;
+    return 0;
+#endif
+}
+
+// Acquisition the FPGA used for the last capture read (SCOPE_HW_ACQ_*).
+uint8_t scope_hw_capture_acquisition(void) {
+#if FPGA_HW_TRIGGER && SCOPE_HW_CAPTURE
+    return scope_capture_acq == FPGA_ACQ_PEAK ? SCOPE_HW_ACQ_PEAK : SCOPE_HW_ACQ_NORMAL;
+#else
+    return SCOPE_HW_ACQ_NORMAL;
 #endif
 }
 

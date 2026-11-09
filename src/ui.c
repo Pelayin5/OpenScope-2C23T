@@ -302,6 +302,7 @@ static uint8_t scope_frame_valid;
 // Peak detect (open HW4 bitstream): whether the shown frame is a peak capture (pair 2k = group
 // minimum, pair 2k+1 = group maximum), and the selected acquisition (ACQUIRE, CH1 long press).
 static uint8_t scope_capture_peak;
+static uint8_t scope_capture_hires;
 #if FPGA_HW_TRIGGER
 static uint8_t scope_acquisition;
 // Trigger types of the open HW4 bitstream (trigger menu): times in a 1-2-5 list,
@@ -1925,12 +1926,15 @@ static void math_menu_step_selected(int8_t dir) {
 }
 
 #if FPGA_HW_TRIGGER
-static uint8_t scope_peak_possible(void);
+static uint8_t scope_acquisition_possible(void);
 static void cycle_u8(uint8_t *value, uint8_t count, int8_t dir);
-static const char *const scope_acquisition_labels[] = {"NORMAL", "PEAK DETECT"};
+static const char *const scope_acquisition_labels[] = {"NORMAL", "PEAK DETECT", "HI-RES"};
 
+// HI-RES is offered only by a bitstream that has it (extended status feature bit).
 static void scope_cycle_acquisition(int8_t dir) {
-    cycle_u8(&scope_acquisition, SETTINGS_SCOPE_ACQUISITION_COUNT, dir);
+    do {
+        cycle_u8(&scope_acquisition, SETTINGS_SCOPE_ACQUISITION_COUNT, dir);
+    } while (scope_acquisition == SCOPE_HW_ACQ_HIRES && !(scope_hw_features() & FPGA_FEATURE_HIRES));
     scope_trace_invalidate();
 }
 #endif
@@ -2020,10 +2024,11 @@ static void ui_draw_math_menu(void) {
 
 #if FPGA_HW_TRIGGER
             case MENU_ITEM_ACQUIRE:
-                // peak detect needs decimated Y-T captures without FFT or math
-                if (scope_acquisition && !scope_peak_possible()) color_fg = RGB565(120, 120, 120);
+                // peak detect needs decimated Y-T captures without FFT or math, hi-res decimated
+                // captures (more than 2 cycles per entry)
+                if (!scope_acquisition_possible()) color_fg = RGB565(120, 120, 120);
                 lcd_text(box_x + 12, row_y + 3, "ACQUIRE:", color_fg, color_bg, 1);
-                lcd_text(box_x + 110, row_y + 3, scope_acquisition_labels[scope_acquisition ? 1u : 0u], color_fg, color_bg, 1);
+                lcd_text(box_x + 110, row_y + 3, scope_acquisition_labels[scope_acquisition < 3u ? scope_acquisition : 0u], color_fg, color_bg, 1);
                 break;
 #endif
 
@@ -4909,6 +4914,29 @@ static uint8_t scope_peak_active(void) {
     return scope_acquisition == SCOPE_HW_ACQ_PEAK && scope_peak_possible();
 }
 
+// High resolution keeps the normal buffer format, so it also serves FFT, math, X-Y and ROLL;
+// the FPGA averages at least two cycles per entry (more than two cycles: span < 0x80000).
+static uint8_t scope_hires_possible(void) {
+    return (scope_hw_features() & FPGA_FEATURE_HIRES) &&
+           !scope_slow_roll_active() &&
+           !scope_auto_zero_active &&
+           scope_hw_span_for_unit_ns(scope_timebase_unit_ns_value()) < SCOPE_HW_SPAN_MAX / 2u;
+}
+
+static uint8_t scope_hires_active(void) {
+    return scope_acquisition == SCOPE_HW_ACQ_HIRES && scope_hires_possible();
+}
+
+static uint8_t scope_acquisition_possible(void) {
+    if (scope_acquisition == SCOPE_HW_ACQ_PEAK) {
+        return scope_peak_possible();
+    }
+    if (scope_acquisition == SCOPE_HW_ACQ_HIRES) {
+        return scope_hires_possible();
+    }
+    return 1;
+}
+
 // Trigger time i (0: TIME 1 = X, 1: TIME 2 = Y) in samples of the current timebase, >= 1.
 static uint16_t scope_trig_samples(uint8_t i) {
     uint32_t period = scope_sample_period_ns();
@@ -4953,7 +4981,8 @@ static void scope_hw_trigger_sync(void) {
     trigger.falling = ui.scope_trigger_edge;
     trigger.level = ui.scope_trigger_level;
     trigger.pre_samples = pre;
-    trigger.acquisition = scope_peak_active() ? SCOPE_HW_ACQ_PEAK : SCOPE_HW_ACQ_NORMAL;
+    trigger.acquisition = scope_peak_active() ? SCOPE_HW_ACQ_PEAK :
+                          scope_hires_active() ? SCOPE_HW_ACQ_HIRES : SCOPE_HW_ACQ_NORMAL;
     trigger.type = scope_trigger_type;
     trigger.pulse = scope_pulse_cond;
     trigger.width_lo = scope_trig_samples(0);
@@ -5123,8 +5152,10 @@ static uint8_t scope_poll_frame(void) {
     scope_copy_capture_samples();
 #if FPGA_HW_TRIGGER
     scope_capture_peak = scope_hw_capture_acquisition() == SCOPE_HW_ACQ_PEAK;
+    scope_capture_hires = scope_hw_capture_acquisition() == SCOPE_HW_ACQ_HIRES;
 #else
     scope_capture_peak = 0;
+    scope_capture_hires = 0;
 #endif
 
     scope_frame_valid = 1;
@@ -6766,6 +6797,9 @@ static void draw_scope_trigger_glyph(uint16_t x, uint16_t y, uint8_t type, uint8
 }
 
 static const char *scope_acquisition_badge(void) {
+    if (scope_acquisition == SCOPE_HW_ACQ_HIRES) {
+        return "HI-RES";
+    }
     return scope_acquisition == SCOPE_HW_ACQ_PEAK ? "PEAK" : 0;
 }
 
@@ -6825,7 +6859,7 @@ static void draw_scope_trigger_status(uint16_t bg) {
         x = (uint16_t)(x + level_w);
     }
     if (badge_w) {
-        uint16_t color = scope_peak_possible() ? C_GEN : C_MUTED;
+        uint16_t color = scope_acquisition_possible() ? C_GEN : C_MUTED;
 
         x = (uint16_t)(x + 4u);
         lcd_frame(x, SCOPE_TRIG_STATUS_Y, badge_w, 10, color);
@@ -7077,6 +7111,8 @@ static void draw_scope_immersive(void) {
         draw_scope_measure_readout((uint16_t)(gx + 6u), gy, (uint16_t)(gw - 12u), gh, grid_bg);
         if (scope_capture_peak && ui.scope_display == SCOPE_DISPLAY_YT) {
             lcd_text_transparent((uint16_t)(gx + gw - 28u), (uint16_t)(gy + gh - 10u), "PEAK", C_WARN, 1);
+        } else if (scope_capture_hires) {
+            lcd_text_transparent((uint16_t)(gx + gw - 40u), (uint16_t)(gy + gh - 10u), "HI-RES", C_WARN, 1);
         }
     } else {
         lcd_text_center(gx, (uint16_t)(gy + 82u), gw, scope_hw_ready() ? "WAIT" : "FPGA", C_MUTED, grid_bg, 2);

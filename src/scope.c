@@ -57,6 +57,7 @@ static uint8_t scope_trigger_tail[FPGA_TRIGGER_TAIL_BYTES] = {0, 1, 2, 3, 4, 5, 
 static uint8_t scope_trigger_ext[FPGA_TRIGGER_EXT_BYTES];
 static uint8_t scope_trigger_ext_status[FPGA_EXT_STATUS_BYTES];
 static uint8_t scope_capture_acq;
+static uint8_t scope_features;
 static uint8_t scope_counter_valid;
 static uint8_t scope_counter_channel;
 static uint64_t scope_counter_mhz;
@@ -114,6 +115,9 @@ static void scope_trigger_read_status(void) {
     // The buffer format follows what the FPGA did (peak detect is refused at full rate).
     scope_capture_acq = (valid & 2u) ? (uint8_t)(scope_trigger_ext_status[FPGA_EXT_STATUS_ACQ] & 3u) :
                                         (uint8_t)FPGA_ACQ_NORMAL;
+    if (valid & 2u) {
+        scope_features = scope_trigger_ext_status[FPGA_EXT_STATUS_FEATURES];
+    }
     scope_counter_read((valid & 2u) ? scope_trigger_ext_status : 0);
     if (scope_trigger_tail[0] != FPGA_TRIGGER_MAGIC ||
         !scope_trigger_status_valid ||
@@ -725,6 +729,8 @@ void scope_hw_set_trigger(const scope_hw_trigger_t *trigger) {
     pre_samples = trigger->pre_samples;
     if (trigger->acquisition == SCOPE_HW_ACQ_PEAK) {
         ext[0] = FPGA_ACQ_PEAK;
+    } else if (trigger->acquisition == SCOPE_HW_ACQ_HIRES) {
+        ext[0] = FPGA_ACQ_HIRES;
     }
     if (trigger->enabled && trigger->type <= SCOPE_HW_TYPE_WINDOW && trigger->type != SCOPE_HW_TYPE_EDGE) {
         ext[1] = (uint8_t)(trigger->type | ((trigger->pulse & 3u) << 2));
@@ -819,9 +825,21 @@ uint8_t scope_hw_counter_mhz(uint8_t channel, uint64_t *mhz) {
 // Acquisition the FPGA used for the last capture read (SCOPE_HW_ACQ_*).
 uint8_t scope_hw_capture_acquisition(void) {
 #if FPGA_HW_TRIGGER && SCOPE_HW_CAPTURE
-    return scope_capture_acq == FPGA_ACQ_PEAK ? SCOPE_HW_ACQ_PEAK : SCOPE_HW_ACQ_NORMAL;
+    if (scope_capture_acq == FPGA_ACQ_PEAK) {
+        return SCOPE_HW_ACQ_PEAK;
+    }
+    return scope_capture_acq == FPGA_ACQ_HIRES ? SCOPE_HW_ACQ_HIRES : SCOPE_HW_ACQ_NORMAL;
 #else
     return SCOPE_HW_ACQ_NORMAL;
+#endif
+}
+
+// Feature bits of the bitstream (extended status byte 33), 0 until the first status read.
+uint8_t scope_hw_features(void) {
+#if FPGA_HW_TRIGGER && SCOPE_HW_CAPTURE
+    return scope_features;
+#else
+    return 0;
 #endif
 }
 

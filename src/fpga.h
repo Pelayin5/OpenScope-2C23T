@@ -52,6 +52,9 @@ enum {
     FPGA_TRIGGER_EXT_BYTES = 8,
     FPGA_ACQ_NORMAL = 0,
     FPGA_ACQ_PEAK = 1,
+    // High resolution: every entry is the rounded mean of its first 2^k fast cycles (span <
+    // 0x80000); extended status byte 34 bits 7..4 = k.
+    FPGA_ACQ_HIRES = 2,
     // Extension byte 1: trigger type [1:0] and pulse condition [3:2]; byte 2: window high
     // level; bytes 4..7: X, Y in source samples (MSB first).
     FPGA_TRIGGER_TYPE_EDGE = 0,
@@ -75,6 +78,7 @@ enum {
     // cycles: f = count * 32 * 50 MHz / 2^22 (262144 = 100 MHz). Bytes 35..37 count (MSB
     // first), 38 bit 0 present and bits 7..4 sequence, 39 clock mode (1 probe, 2 fast clock).
     FPGA_FEATURE_PLL_METER = 1u << 3,
+    FPGA_FEATURE_HIRES = 1u << 4,
     FPGA_EXT_STATUS_PLL_COUNT = 11,
     FPGA_EXT_STATUS_PLL_FLAGS = 14,
     FPGA_EXT_STATUS_CLK_MODE = 15,

@@ -24,6 +24,7 @@ enum {
 enum {
     SCOPE_HW_ACQ_NORMAL,
     SCOPE_HW_ACQ_PEAK,
+    SCOPE_HW_ACQ_HIRES,
 };
 
 enum {
@@ -123,6 +124,7 @@ uint16_t scope_hw_error_count(void);
 uint8_t scope_hw_last_status(void);
 void scope_hw_set_trigger(const scope_hw_trigger_t *trigger);
 uint8_t scope_hw_capture_acquisition(void);
+uint8_t scope_hw_features(void);
 uint8_t scope_hw_counter_mhz(uint8_t channel, uint64_t *mhz);
 uint8_t scope_hw_trigger_position(uint16_t *pre_samples);
 uint8_t scope_hw_trigger_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES]);

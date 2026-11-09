@@ -170,10 +170,46 @@ static void test_counter(void) {
     assert(scope_hw_div_u64(1000u, 0u) == 0u);
 }
 
+// High resolution: acquisition 2 in the extension, the buffer format and the feature bit follow
+// the extended status (byte 34 carries k in bits 7..4).
+static void test_hires(void) {
+    scope_hw_trigger_t t = {1, SCOPE_HW_TRIGGER_NORMAL, 0, 0, 140u, 600u, SCOPE_HW_ACQ_HIRES,
+                            SCOPE_HW_TYPE_EDGE, 0, 0, 0, 0};
+
+    status_valid = 0;
+    scope_hw_set_trigger(&t);
+    assert(tail[1] == (FPGA_TRIGGER_MODE_NORMAL | FPGA_TRIGGER_EXTENDED) && ext[0] == FPGA_ACQ_HIRES);
+    // without the hardware trigger: forced capture, still averaged
+    t.enabled = 0;
+    scope_hw_set_trigger(&t);
+    assert(tail[0] == FPGA_TRIGGER_MAGIC &&
+           tail[1] == (FPGA_TRIGGER_MODE_FORCE | FPGA_TRIGGER_EXTENDED) && ext[0] == FPGA_ACQ_HIRES);
+    t.enabled = 1;
+    scope_hw_set_trigger(&t);
+    status_valid = 3;
+    ext_status[FPGA_EXT_STATUS_FEATURES] = FPGA_FEATURE_PEAK | FPGA_FEATURE_COUNTER | FPGA_FEATURE_HIRES;
+    ext_status[FPGA_EXT_STATUS_ACQ] = (uint8_t)(0x30u | FPGA_ACQ_HIRES);
+    capture();
+    assert(scope_hw_capture_acquisition() == SCOPE_HW_ACQ_HIRES);
+    assert(scope_hw_features() & FPGA_FEATURE_HIRES);
+    // refused (at most 2 cycles per entry): normal buffer
+    ext_status[FPGA_EXT_STATUS_ACQ] = FPGA_ACQ_NORMAL;
+    capture();
+    assert(scope_hw_capture_acquisition() == SCOPE_HW_ACQ_NORMAL);
+    // a read-back without the extended status keeps the last feature byte
+    status_valid = 1;
+    capture();
+    assert(scope_hw_features() & FPGA_FEATURE_HIRES);
+    status_valid = 3;
+    t.acquisition = SCOPE_HW_ACQ_NORMAL;
+    scope_hw_set_trigger(&t);
+}
+
 int main(void) {
     test_config();
     test_status();
     test_counter();
-    puts("scope hardware status decode tests passed (peak detect, counter)");
+    test_hires();
+    puts("scope hardware status decode tests passed (peak detect, counter, high resolution)");
     return 0;
 }

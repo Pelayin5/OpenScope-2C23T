@@ -34,6 +34,12 @@ uint8_t scope_hw_capture_acquisition(void) {
     return hw_capture_acq;
 }
 
+static uint8_t hw_features;
+
+uint8_t scope_hw_features(void) {
+    return hw_features;
+}
+
 static uint8_t hw_counter_ch = 0xFFu;
 static uint64_t hw_counter_value;
 
@@ -451,6 +457,45 @@ static void test_acquire_and_status(void) {
     scope_acquisition = SCOPE_HW_ACQ_NORMAL;
 }
 
+// HI-RES: offered when the bitstream has it, sent at decimated spans (more than 2 cycles per
+// entry) in every view, shown in the top bar.
+static void test_hires(void) {
+    setup();
+    hw_features = 0;
+    scope_acquisition = SCOPE_HW_ACQ_PEAK;
+    scope_cycle_acquisition(1);
+    assert(scope_acquisition == SCOPE_HW_ACQ_NORMAL);         // no HI-RES in this bitstream
+    hw_features = FPGA_FEATURE_PEAK | FPGA_FEATURE_HIRES;
+    scope_acquisition = SCOPE_HW_ACQ_PEAK;
+    scope_cycle_acquisition(1);
+    assert(scope_acquisition == SCOPE_HW_ACQ_HIRES);
+    assert(strcmp(scope_acquisition_badge(), "HI-RES") == 0);
+    ui.scope_timebase = 15u;                                  // 5MS
+    scope_hw_trigger_sync();
+    assert(hw_enabled && hw_acquisition == SCOPE_HW_ACQ_HIRES && scope_acquisition_possible());
+    // the normal buffer format serves FFT and math as well
+    scope_fft_src = 1u;
+    scope_hw_trigger_sync();
+    assert(hw_acquisition == SCOPE_HW_ACQ_HIRES);
+    scope_fft_src = 0;
+    // span 0x80000 and faster: at most 2 cycles per entry, nothing to average
+    for (ui.scope_timebase = 0; ui.scope_timebase < 15u; ++ui.scope_timebase) {
+        uint8_t decimated = scope_hw_span_for_unit_ns(scope_timebase_unit_ns_value()) < SCOPE_HW_SPAN_MAX / 2u;
+        scope_hw_trigger_sync();
+        assert(hw_acquisition == (decimated ? SCOPE_HW_ACQ_HIRES : SCOPE_HW_ACQ_NORMAL));
+        assert(scope_acquisition_possible() == decimated);
+    }
+    ui.scope_timebase = 4u;
+    assert(!scope_acquisition_possible());
+    hw_features = FPGA_FEATURE_PEAK;
+    ui.scope_timebase = 15u;
+    assert(!scope_acquisition_possible());
+    scope_hw_trigger_sync();
+    assert(hw_acquisition == SCOPE_HW_ACQ_NORMAL);
+    scope_acquisition = SCOPE_HW_ACQ_NORMAL;
+    hw_features = 0;
+}
+
 int main(void) {
     test_settings();
     test_window();
@@ -460,6 +505,7 @@ int main(void) {
     test_trigger_types();
     test_trigger_menu();
     test_acquire_and_status();
+    test_hires();
     puts("scope hardware trigger mapping, peak detect, counter readout and trigger type tests passed");
     return 0;
 }

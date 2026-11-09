@@ -56,8 +56,51 @@ static void test_split_values(void) {
     assert(settings.scope_trigger_level == 12u);
 }
 
+// Trigger type, pulse width condition, T1/T2, window high level and acquisition (open HW4
+// bitstream) in two records after the generator ones.
+static void test_trigger_records(void) {
+    settings_state_t settings;
+    uint8_t legacy_mode;
+
+    memset(flash, 0xFF, sizeof(flash));
+    record_count = 0;
+    assert(!settings_load(&settings));
+    assert(settings.scope_trigger_type == 0u && settings.scope_pulse_cond == SETTINGS_SCOPE_PULSE_DEFAULT);
+    assert(settings.scope_trigger_time[0] == SETTINGS_SCOPE_TRIGGER_TIME_DEFAULT_1 &&
+           settings.scope_trigger_time[1] == SETTINGS_SCOPE_TRIGGER_TIME_DEFAULT_2);
+    assert(settings.scope_window_high == SETTINGS_SCOPE_WINDOW_HIGH_DEFAULT && settings.scope_acquisition == 0u);
+
+    put_record(SETTINGS_STATE_SCOPE_TRIG_TYPE, (uint16_t)(3u | (2u << 2) | (1u << 4) | (200u << 8)));
+    put_record(SETTINGS_STATE_SCOPE_TRIG_TIME, (uint16_t)(7u | (22u << 5)));
+    assert(settings_load(&settings));
+    assert(settings.scope_trigger_type == 3u && settings.scope_pulse_cond == 2u && settings.scope_acquisition == 1u);
+    assert(settings.scope_window_high == 200u);
+    assert(settings.scope_trigger_time[0] == 7u && settings.scope_trigger_time[1] == 22u);
+
+    // out of range values fall back to the defaults
+    put_record(SETTINGS_STATE_SCOPE_TRIG_TYPE, (uint16_t)(3u << 2 | 3u << 4 | 5u << 8));
+    put_record(SETTINGS_STATE_SCOPE_TRIG_TIME, (uint16_t)(30u | (23u << 5)));
+    assert(settings_load(&settings));
+    assert(settings.scope_pulse_cond == SETTINGS_SCOPE_PULSE_DEFAULT && settings.scope_acquisition == 0u);
+    assert(settings.scope_window_high == 12u);
+    assert(settings.scope_trigger_time[0] == SETTINGS_SCOPE_TRIGGER_TIME_DEFAULT_1 &&
+           settings.scope_trigger_time[1] == SETTINGS_SCOPE_TRIGGER_TIME_DEFAULT_2);
+
+    // the new state type shares its top byte with the legacy DMM record: neither decodes as the other
+    for (uint32_t payload = 0; payload <= 0xFFFFu; ++payload) {
+        assert(!settings_legacy_record_valid(settings_state_record(SETTINGS_STATE_SCOPE_TRIG_TYPE, (uint16_t)payload),
+                                             &legacy_mode));
+    }
+    for (uint32_t value = 0; value <= 0xFFu; ++value) {
+        uint32_t legacy = SETTINGS_LEGACY_MAGIC | (value << 8) | (uint8_t)(value ^ 0x5Au);
+        assert(!settings_state_record_valid(legacy, &settings));
+    }
+    assert(SETTINGS_STATE_WORDS == 26u);
+}
+
 int main(void) {
     test_split_values();
-    printf("settings: split 32-bit records restore without partial clamping passed\n");
+    test_trigger_records();
+    printf("settings: split 32-bit records restore without partial clamping, trigger records passed\n");
     return 0;
 }

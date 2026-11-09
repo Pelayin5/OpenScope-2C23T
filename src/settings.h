@@ -33,6 +33,14 @@ enum {
     SETTINGS_SIGGEN_FM_SOURCE_COUNT = 3, // 0 = SINE, 1 = TRIANGLE, 2 = SQUARE
     SETTINGS_BODE_MIN_STEPS = 10,
     SETTINGS_BODE_MAX_STEPS = 80,
+    SETTINGS_SCOPE_TRIGGER_TYPE_COUNT = 4,   // EDGE, PULSE, TIMEOUT, WINDOW (open HW4 bitstream)
+    SETTINGS_SCOPE_PULSE_COUNT = 3,          // width <= T1, > T1, T1 < width <= T2
+    SETTINGS_SCOPE_PULSE_DEFAULT = 1,
+    SETTINGS_SCOPE_TRIGGER_TIME_COUNT = 23,  // 100 ns .. 2 s, 1-2-5
+    SETTINGS_SCOPE_TRIGGER_TIME_DEFAULT_1 = 12,
+    SETTINGS_SCOPE_TRIGGER_TIME_DEFAULT_2 = 15,
+    SETTINGS_SCOPE_WINDOW_HIGH_DEFAULT = 192,
+    SETTINGS_SCOPE_ACQUISITION_COUNT = 2,    // NORMAL, PEAK DETECT
 };
 
 typedef struct {
@@ -87,6 +95,11 @@ typedef struct {
     uint32_t bode_start_hz;
     uint32_t bode_stop_hz;
     uint8_t bode_steps;
+    uint8_t scope_trigger_type;
+    uint8_t scope_pulse_cond;
+    uint8_t scope_trigger_time[2]; // T1, T2: index in the 1-2-5 list
+    uint8_t scope_window_high;
+    uint8_t scope_acquisition;
 
 } settings_state_t;
 

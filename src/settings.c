@@ -38,10 +38,12 @@ enum {
     SETTINGS_STATE_SIGGEN_SWEEP_START_HI = 0xDEu,
     SETTINGS_STATE_SIGGEN_SWEEP_STOP_LO = 0xDFu,
     SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI = 0xE0u,
+    SETTINGS_STATE_SCOPE_TRIG_TYPE = 0xE1u,
+    SETTINGS_STATE_SCOPE_TRIG_TIME = 0xE2u,
     SETTINGS_SCOPE_BIAS_DEFAULT = 1861u,
     SETTINGS_SCOPE_BIAS_RATE_DEFAULT = 505u,
     SETTINGS_SCOPE_CAL_WORDS = SETTINGS_SCOPE_CHANNEL_COUNT * SETTINGS_SCOPE_RANGE_COUNT * 2,
-    SETTINGS_STATE_WORDS = SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI -
+    SETTINGS_STATE_WORDS = SETTINGS_STATE_SCOPE_TRIG_TIME -
                            SETTINGS_STATE_SCOPE_CORE + 1u,
     SETTINGS_WRITE_BYTES = 4u * (1u + SETTINGS_SCOPE_CAL_WORDS + SETTINGS_STATE_WORDS),
     FLASH_BANK2_BASE = 0x08080000u,
@@ -115,6 +117,12 @@ static void settings_defaults(settings_state_t *settings) {
     settings->bode_start_hz = 100u;
     settings->bode_stop_hz = 100000u;
     settings->bode_steps = 40u;
+    settings->scope_trigger_type = 0;
+    settings->scope_pulse_cond = SETTINGS_SCOPE_PULSE_DEFAULT;
+    settings->scope_trigger_time[0] = SETTINGS_SCOPE_TRIGGER_TIME_DEFAULT_1;
+    settings->scope_trigger_time[1] = SETTINGS_SCOPE_TRIGGER_TIME_DEFAULT_2;
+    settings->scope_window_high = SETTINGS_SCOPE_WINDOW_HIGH_DEFAULT;
+    settings->scope_acquisition = 0;
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         settings->scope_ch_enabled[ch] = 1;
         settings->scope_probe_x10[ch] = 0;
@@ -170,6 +178,12 @@ static void settings_copy(settings_state_t *dst, const settings_state_t *src) {
     dst->bode_start_hz = src->bode_start_hz;
     dst->bode_stop_hz = src->bode_stop_hz;
     dst->bode_steps = src->bode_steps;
+    dst->scope_trigger_type = src->scope_trigger_type;
+    dst->scope_pulse_cond = src->scope_pulse_cond;
+    dst->scope_trigger_time[0] = src->scope_trigger_time[0];
+    dst->scope_trigger_time[1] = src->scope_trigger_time[1];
+    dst->scope_window_high = src->scope_window_high;
+    dst->scope_acquisition = src->scope_acquisition;
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         dst->scope_ch_enabled[ch] = src->scope_ch_enabled[ch];
         dst->scope_probe_x10[ch] = src->scope_probe_x10[ch];
@@ -227,7 +241,13 @@ static uint8_t settings_equal(const settings_state_t *a, const settings_state_t 
         a->siggen_fm_freq_hz != b->siggen_fm_freq_hz ||
         a->bode_start_hz != b->bode_start_hz ||
         a->bode_stop_hz != b->bode_stop_hz ||
-        a->bode_steps != b->bode_steps) {
+        a->bode_steps != b->bode_steps ||
+        a->scope_trigger_type != b->scope_trigger_type ||
+        a->scope_pulse_cond != b->scope_pulse_cond ||
+        a->scope_trigger_time[0] != b->scope_trigger_time[0] ||
+        a->scope_trigger_time[1] != b->scope_trigger_time[1] ||
+        a->scope_window_high != b->scope_window_high ||
+        a->scope_acquisition != b->scope_acquisition) {
         return 0;
     }
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
@@ -372,6 +392,26 @@ static void settings_clamp(settings_state_t *settings) {
         settings->bode_steps = SETTINGS_BODE_MIN_STEPS;
     } else if (settings->bode_steps > SETTINGS_BODE_MAX_STEPS) {
         settings->bode_steps = SETTINGS_BODE_MAX_STEPS;
+    }
+    if (settings->scope_trigger_type >= SETTINGS_SCOPE_TRIGGER_TYPE_COUNT) {
+        settings->scope_trigger_type = 0;
+    }
+    if (settings->scope_pulse_cond >= SETTINGS_SCOPE_PULSE_COUNT) {
+        settings->scope_pulse_cond = SETTINGS_SCOPE_PULSE_DEFAULT;
+    }
+    if (settings->scope_trigger_time[0] >= SETTINGS_SCOPE_TRIGGER_TIME_COUNT) {
+        settings->scope_trigger_time[0] = SETTINGS_SCOPE_TRIGGER_TIME_DEFAULT_1;
+    }
+    if (settings->scope_trigger_time[1] >= SETTINGS_SCOPE_TRIGGER_TIME_COUNT) {
+        settings->scope_trigger_time[1] = SETTINGS_SCOPE_TRIGGER_TIME_DEFAULT_2;
+    }
+    if (settings->scope_window_high < 12u) {
+        settings->scope_window_high = 12u;
+    } else if (settings->scope_window_high > 243u) {
+        settings->scope_window_high = 243u;
+    }
+    if (settings->scope_acquisition >= SETTINGS_SCOPE_ACQUISITION_COUNT) {
+        settings->scope_acquisition = 0;
     }
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         settings->scope_ch_enabled[ch] = settings->scope_ch_enabled[ch] ? 1u : 0u;
@@ -604,6 +644,14 @@ static uint8_t settings_state_record_valid(uint32_t record, settings_state_t *se
         settings->siggen_sweep_stop_hz = (settings->siggen_sweep_stop_hz & 0xFFFF0000u) | payload;
     } else if (type == SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI) {
         settings->siggen_sweep_stop_hz = (settings->siggen_sweep_stop_hz & 0x0000FFFFu) | ((uint32_t)payload << 16);
+    } else if (type == SETTINGS_STATE_SCOPE_TRIG_TYPE) {
+        settings->scope_trigger_type = (uint8_t)(payload & 0x03u);
+        settings->scope_pulse_cond = (uint8_t)((payload >> 2) & 0x03u);
+        settings->scope_acquisition = (uint8_t)((payload >> 4) & 0x03u);
+        settings->scope_window_high = (uint8_t)(payload >> 8);
+    } else if (type == SETTINGS_STATE_SCOPE_TRIG_TIME) {
+        settings->scope_trigger_time[0] = (uint8_t)(payload & 0x1Fu);
+        settings->scope_trigger_time[1] = (uint8_t)((payload >> 5) & 0x1Fu);
     } else {
         return 0;
     }
@@ -728,6 +776,18 @@ static void settings_write_state_records(uint32_t *addr, const settings_state_t 
     *addr += 4u;
     flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SIGGEN_SWEEP_STOP_HI,
                                                     (uint16_t)(settings->siggen_sweep_stop_hz >> 16)));
+    *addr += 4u;
+
+    payload = (uint16_t)((settings->scope_trigger_type & 0x03u) |
+                         ((settings->scope_pulse_cond & 0x03u) << 2) |
+                         ((settings->scope_acquisition & 0x03u) << 4) |
+                         ((uint16_t)settings->scope_window_high << 8));
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SCOPE_TRIG_TYPE, payload));
+    *addr += 4u;
+
+    payload = (uint16_t)((settings->scope_trigger_time[0] & 0x1Fu) |
+                         ((settings->scope_trigger_time[1] & 0x1Fu) << 5));
+    flash_program_word(*addr, settings_state_record(SETTINGS_STATE_SCOPE_TRIG_TIME, payload));
     *addr += 4u;
 }
 

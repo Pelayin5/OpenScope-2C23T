@@ -99,7 +99,8 @@ typedef enum {
     MENU_ITEM_BODE_START,
     MENU_ITEM_BODE_STOP,
     MENU_ITEM_BODE_STEPS,
-    MENU_ITEM_BODE_SWEEP
+    MENU_ITEM_BODE_SWEEP,
+    MENU_ITEM_ACQUIRE
 } math_menu_item_t;
 
 static const uint8_t math_menu_order[] = {
@@ -108,7 +109,10 @@ static const uint8_t math_menu_order[] = {
     MENU_ITEM_FFT_DISPLAY,
     MENU_ITEM_MATH_MODE,
     MENU_ITEM_MATH_OP,
-    MENU_ITEM_HIDE_TRACES
+    MENU_ITEM_HIDE_TRACES,
+#if FPGA_HW_TRIGGER
+    MENU_ITEM_ACQUIRE,
+#endif
 };
 
 static const uint8_t bode_menu_order[] = {
@@ -295,12 +299,12 @@ static uint8_t arb_samples[2048];
 static uint8_t scope_samples[SCOPE_SAMPLE_BYTES] __attribute__((aligned(4)));
 static uint8_t scope_capture_samples[SCOPE_SAMPLE_BYTES] __attribute__((aligned(4)));
 static uint8_t scope_frame_valid;
-// Peak detect (open HW4 bitstream): the selected acquisition, and whether the shown frame is a
-// peak capture (pair 2k = group minimum, pair 2k+1 = group maximum).
-static uint8_t scope_acquisition;
+// Peak detect (open HW4 bitstream): whether the shown frame is a peak capture (pair 2k = group
+// minimum, pair 2k+1 = group maximum), and the selected acquisition (ACQUIRE, CH1 long press).
 static uint8_t scope_capture_peak;
 #if FPGA_HW_TRIGGER
-// Trigger types of the open HW4 bitstream (ACQUIRE / TRIGGER menu): times in a 1-2-5 list,
+static uint8_t scope_acquisition;
+// Trigger types of the open HW4 bitstream (trigger menu): times in a 1-2-5 list,
 // converted to samples of the current timebase when sent to the FPGA.
 static const uint32_t scope_trig_times_ns[] = {
     100u, 200u, 500u, 1000u, 2000u, 5000u, 10000u, 20000u, 50000u,
@@ -482,6 +486,12 @@ static void ui_settings_copy(settings_state_t *dst, const settings_state_t *src)
     dst->bode_start_hz = src->bode_start_hz;
     dst->bode_stop_hz = src->bode_stop_hz;
     dst->bode_steps = src->bode_steps;
+    dst->scope_trigger_type = src->scope_trigger_type;
+    dst->scope_pulse_cond = src->scope_pulse_cond;
+    dst->scope_trigger_time[0] = src->scope_trigger_time[0];
+    dst->scope_trigger_time[1] = src->scope_trigger_time[1];
+    dst->scope_window_high = src->scope_window_high;
+    dst->scope_acquisition = src->scope_acquisition;
     for (uint8_t ch = 0; ch < SETTINGS_SCOPE_CHANNEL_COUNT; ++ch) {
         dst->scope_ch_enabled[ch] = src->scope_ch_enabled[ch];
         dst->scope_probe_x10[ch] = src->scope_probe_x10[ch];
@@ -598,6 +608,11 @@ enum {
     SCOPE_PARAM_TRIG_TYPE,
     SCOPE_PARAM_TRIG_EDGE,
     SCOPE_PARAM_MEASURE,
+    SCOPE_PARAM_TRIG_KIND,
+    SCOPE_PARAM_TRIG_WIDTH,
+    SCOPE_PARAM_TRIG_T1,
+    SCOPE_PARAM_TRIG_T2,
+    SCOPE_PARAM_TRIG_HIGH,
     SCOPE_PARAM_COUNT,
 };
 
@@ -676,7 +691,7 @@ static const char *const scope_trigger_short[] = {"AUTO", "NORM", "SNGL"};
 static const char *const scope_measure_labels[] = {"VPP", "VMAX", "VMIN", "VAVG", "VRMS", "FREQ"};
 static const char *const scope_param_labels[] = {
     "VIEW", "ON", "PROBE", "V/DIV", "COUP", "ZERO", "POS", "TIME", "TRIG", "CUR",
-    "SRC", "LEVEL", "MODE", "EDGE", "MEAS",
+    "SRC", "LEVEL", "MODE", "EDGE", "MEAS", "TYPE", "WIDTH", "T1", "T2", "HIGH",
 };
 static const uint8_t scope_global_param_order[] = {
     SCOPE_PARAM_POSITION,
@@ -690,12 +705,14 @@ static const uint8_t scope_channel_param_order[] = {
     SCOPE_PARAM_COUPLING,
     SCOPE_PARAM_GAIN,
 };
+#if !FPGA_HW_TRIGGER
 static const uint8_t scope_trigger_param_order[] = {
     SCOPE_PARAM_TRIG_SOURCE,
     SCOPE_PARAM_TRIG_EDGE,
     SCOPE_PARAM_TRIG_TYPE,
     SCOPE_PARAM_TRIG_LEVEL,
 };
+#endif
 static const char *const gen_wave_labels[] = {
     "SINE", "RECT", "SAW", "HALF", "FULL",
     "P STEP", "R STEP", "EXP UP", "EXP DN", "DC",
@@ -1099,6 +1116,11 @@ static void draw_header_icon(uint16_t x, uint16_t y, const char *text, uint16_t 
     lcd_text((uint16_t)(x + 4u), (uint16_t)(y + 1u), text, color, bg, 1);
 }
 
+#if FPGA_HW_TRIGGER
+// x of the next free status icon slot (the trigger status ends where it would)
+static uint16_t ui_status_icons_x = 224u;
+#endif
+
 static void draw_all_active_status_icons(uint16_t start_x, uint16_t y, uint16_t bg) {
     uint16_t current_x = start_x;
 
@@ -1142,6 +1164,9 @@ static void draw_all_active_status_icons(uint16_t start_x, uint16_t y, uint16_t 
         }
         lcd_rect(134, y, clear_width, 10, bg);
     }
+#if FPGA_HW_TRIGGER
+    ui_status_icons_x = current_x;
+#endif
 }
 
 static void draw_battery_status_header(void) {
@@ -1429,10 +1454,90 @@ static uint8_t scope_param_is_channel(uint8_t param) {
                                 param);
 }
 
+#if FPGA_HW_TRIGGER
+enum {
+    SCOPE_TRIGGER_SLOTS = 4,
+    SCOPE_TRIGGER_ROWS_MAX = 8,
+};
+static uint8_t scope_trigger_row_first;
+
+// Trigger menu chips of the open HW4 bitstream by trigger type: TYPE, SRC, the edge (polarity)
+// or the window low level, and LEVEL (window: HIGH) come first, under F1, F2 and F4 as before;
+// the type's own settings and MODE follow. Only the chips of the current type are shown.
+static uint8_t scope_trigger_rows(uint8_t rows[SCOPE_TRIGGER_ROWS_MAX]) {
+    uint8_t count = 0;
+
+    rows[count++] = SCOPE_PARAM_TRIG_KIND;
+    rows[count++] = SCOPE_PARAM_TRIG_SOURCE;
+    if (scope_trigger_type == SCOPE_HW_TYPE_WINDOW) {
+        rows[count++] = SCOPE_PARAM_TRIG_LEVEL;
+        rows[count++] = SCOPE_PARAM_TRIG_HIGH;
+    } else {
+        rows[count++] = SCOPE_PARAM_TRIG_EDGE;
+        rows[count++] = SCOPE_PARAM_TRIG_LEVEL;
+    }
+    if (scope_trigger_type == SCOPE_HW_TYPE_PULSE) {
+        rows[count++] = SCOPE_PARAM_TRIG_WIDTH;
+    }
+    if (scope_trigger_type == SCOPE_HW_TYPE_PULSE || scope_trigger_type == SCOPE_HW_TYPE_TIMEOUT) {
+        rows[count++] = SCOPE_PARAM_TRIG_T1;
+    }
+    if (scope_trigger_type == SCOPE_HW_TYPE_PULSE && scope_pulse_cond == SCOPE_HW_PULSE_RANGE) {
+        rows[count++] = SCOPE_PARAM_TRIG_T2;
+    }
+    rows[count++] = SCOPE_PARAM_TRIG_TYPE;
+    return count;
+}
+
+// Four chips fit the soft key row: the row scrolls to keep the selected chip in view.
+static uint8_t scope_trigger_rows_first(const uint8_t *rows, uint8_t count) {
+    uint8_t first = scope_trigger_row_first;
+
+    for (uint8_t i = 0; i < count; ++i) {
+        if (rows[i] == ui.scope_param) {
+            if (i < first) {
+                first = i;
+            } else if (i >= first + SCOPE_TRIGGER_SLOTS) {
+                first = (uint8_t)(i - SCOPE_TRIGGER_SLOTS + 1u);
+            }
+            break;
+        }
+    }
+    if (count <= SCOPE_TRIGGER_SLOTS) {
+        first = 0;
+    } else if (first > count - SCOPE_TRIGGER_SLOTS) {
+        first = (uint8_t)(count - SCOPE_TRIGGER_SLOTS);
+    }
+    scope_trigger_row_first = first;
+    return first;
+}
+#endif
+
+// Trigger menu chip shown above soft key slot (0 = F1 .. 3 = F4).
+static uint8_t scope_trigger_slot_param(uint8_t slot, uint8_t param) {
+#if FPGA_HW_TRIGGER
+    uint8_t rows[SCOPE_TRIGGER_ROWS_MAX];
+    uint8_t count = scope_trigger_rows(rows);
+    uint8_t first = scope_trigger_rows_first(rows, count);
+
+    (void)param;
+    return (uint8_t)(first + slot) < count ? rows[first + slot] : ui.scope_param;
+#else
+    (void)slot;
+    return param;
+#endif
+}
+
 static uint8_t scope_param_is_trigger(uint8_t param) {
+#if FPGA_HW_TRIGGER
+    uint8_t rows[SCOPE_TRIGGER_ROWS_MAX];
+
+    return scope_param_in_order(rows, scope_trigger_rows(rows), param);
+#else
     return scope_param_in_order(scope_trigger_param_order,
                                 (uint8_t)sizeof(scope_trigger_param_order),
                                 param);
+#endif
 }
 
 static uint8_t scope_param_is_global(uint8_t param) {
@@ -1673,6 +1778,14 @@ static const char *scope_param_label(uint8_t param) {
     if (param == SCOPE_PARAM_POSITION && !ui.scope_channel_menu) {
         return "MOVE";
     }
+#if FPGA_HW_TRIGGER
+    if (param == SCOPE_PARAM_TRIG_EDGE && scope_trigger_type != SCOPE_HW_TYPE_EDGE) {
+        return "POL";
+    }
+    if (param == SCOPE_PARAM_TRIG_LEVEL && scope_trigger_type == SCOPE_HW_TYPE_WINDOW) {
+        return "LOW";
+    }
+#endif
     return scope_param_labels[param];
 }
 
@@ -1744,8 +1857,52 @@ static const char *scope_trigger_level_label(void) {
 }
 
 static const char *scope_trigger_edge_label(void) {
+#if FPGA_HW_TRIGGER
+    // pulse and timeout: polarity of the active state
+    if (scope_trigger_type != SCOPE_HW_TYPE_EDGE) {
+        return ui.scope_trigger_edge ? "NEG" : "POS";
+    }
+#endif
     return ui.scope_trigger_edge ? "FALL" : "RISE";
 }
+
+#if FPGA_HW_TRIGGER
+static const char *const scope_trigger_kind_labels[] = {"EDGE", "PULSE", "TIMEOUT", "WINDOW"};
+// pulse width condition: SHORT = width <= T1, LONG = width > T1, RANGE = T1 < width <= T2
+static const char *const scope_pulse_cond_labels[] = {"SHORT", "LONG", "RANGE"};
+
+// 1-2-5 time in ns as 100NS, 20US, 5MS, 1S
+static void scope_format_trig_time(char out[12], uint32_t ns) {
+    static const char *const units[] = {"NS", "US", "MS", "S"};
+    uint8_t u = 0;
+    uint8_t n;
+
+    while (ns >= 1000u && u < 3u) {
+        ns /= 1000u;
+        ++u;
+    }
+    scope_format_u32(out, ns);
+    n = scope_text_len(out);
+    scope_text_copy(&out[n], units[u], (uint8_t)(12u - n));
+}
+
+static const char *scope_trigger_time_label(uint8_t i) {
+    static char label[12];
+
+    scope_format_trig_time(label, scope_trig_times_ns[scope_trig_time_idx[i ? 1u : 0u] % SCOPE_TRIG_TIME_COUNT]);
+    return label;
+}
+
+static const char *scope_window_high_label(void) {
+    static char label[11];
+    uint8_t idx = scope_trigger_source_index();
+    int32_t mv = ((int32_t)scope_window_high - 128) *
+                 (int32_t)scope_vdiv_mv_for_channel(idx) * 8 / 255;
+
+    scope_format_signed_mv(label, mv);
+    return label;
+}
+#endif
 
 static void math_menu_step_selected(int8_t dir) {
     uint8_t rows;
@@ -1766,6 +1923,17 @@ static void math_menu_step_selected(int8_t dir) {
         }
     }
 }
+
+#if FPGA_HW_TRIGGER
+static uint8_t scope_peak_possible(void);
+static void cycle_u8(uint8_t *value, uint8_t count, int8_t dir);
+static const char *const scope_acquisition_labels[] = {"NORMAL", "PEAK DETECT"};
+
+static void scope_cycle_acquisition(int8_t dir) {
+    cycle_u8(&scope_acquisition, SETTINGS_SCOPE_ACQUISITION_COUNT, dir);
+    scope_trace_invalidate();
+}
+#endif
 
 static void ui_draw_math_menu(void) {
     if (!ui_math_menu_visible) {
@@ -1849,6 +2017,15 @@ static void ui_draw_math_menu(void) {
                 lcd_text(box_x + 12, row_y + 3, "HIDE TRACES:", color_fg, color_bg, 1);
                 lcd_text(box_x + 110, row_y + 3, hide_traces_text[scope_hide_traces], color_fg, color_bg, 1);
                 break;
+
+#if FPGA_HW_TRIGGER
+            case MENU_ITEM_ACQUIRE:
+                // peak detect needs decimated Y-T captures without FFT or math
+                if (scope_acquisition && !scope_peak_possible()) color_fg = RGB565(120, 120, 120);
+                lcd_text(box_x + 12, row_y + 3, "ACQUIRE:", color_fg, color_bg, 1);
+                lcd_text(box_x + 110, row_y + 3, scope_acquisition_labels[scope_acquisition ? 1u : 0u], color_fg, color_bg, 1);
+                break;
+#endif
 
             case MENU_ITEM_BODE_START:
                 lcd_text(box_x + 12, row_y + 3, "START FREQ:", color_fg, color_bg, 1);
@@ -2726,6 +2903,20 @@ static const char *scope_param_value(uint8_t param) {
     if (param == SCOPE_PARAM_MEASURE) {
         return scope_measure_chip_label();
     }
+#if FPGA_HW_TRIGGER
+    if (param == SCOPE_PARAM_TRIG_KIND) {
+        return scope_trigger_kind_labels[scope_trigger_type & 3u];
+    }
+    if (param == SCOPE_PARAM_TRIG_WIDTH) {
+        return scope_pulse_cond_labels[scope_pulse_cond < 3u ? scope_pulse_cond : SCOPE_HW_PULSE_GT];
+    }
+    if (param == SCOPE_PARAM_TRIG_T1 || param == SCOPE_PARAM_TRIG_T2) {
+        return scope_trigger_time_label(param == SCOPE_PARAM_TRIG_T2);
+    }
+    if (param == SCOPE_PARAM_TRIG_HIGH) {
+        return scope_window_high_label();
+    }
+#endif
     return scope_display_short[scope_safe_display()];
 }
 
@@ -2788,12 +2979,39 @@ static void draw_scope_channel_param_row(uint16_t x, uint16_t y) {
 
 static void draw_scope_trigger_param_row(uint16_t x, uint16_t y) {
     scope_sanitize_state();
+#if FPGA_HW_TRIGGER
+    uint8_t rows[SCOPE_TRIGGER_ROWS_MAX];
+    uint8_t count = scope_trigger_rows(rows);
+    uint8_t first = scope_trigger_rows_first(rows, count);
+    uint16_t right = (uint16_t)(x + (UI_PARAM_CHIP_W + UI_PARAM_CHIP_GAP) * SCOPE_TRIGGER_SLOTS -
+                                UI_PARAM_CHIP_GAP);
+
+    for (uint8_t i = 0; i < SCOPE_TRIGGER_SLOTS && (uint8_t)(first + i) < count; ++i) {
+        draw_scope_param_chip((uint16_t)(x + (UI_PARAM_CHIP_W + UI_PARAM_CHIP_GAP) * i),
+                              y,
+                              UI_PARAM_CHIP_W,
+                              rows[first + i]);
+    }
+    // more chips to the left / right
+    for (uint8_t i = 0; i < 4u; ++i) {
+        uint16_t arrow_y = (uint16_t)(y + 16u - i);
+        uint16_t arrow_h = (uint16_t)(2u * i + 1u);
+
+        if (first) {
+            lcd_rect((uint16_t)(x - 6u + i), arrow_y, 1, arrow_h, C_MUTED);
+        }
+        if (first + SCOPE_TRIGGER_SLOTS < count) {
+            lcd_rect((uint16_t)(right + 5u - i), arrow_y, 1, arrow_h, C_MUTED);
+        }
+    }
+#else
     for (uint8_t i = 0; i < (uint8_t)sizeof(scope_trigger_param_order); ++i) {
         draw_scope_param_chip((uint16_t)(x + (UI_PARAM_CHIP_W + UI_PARAM_CHIP_GAP) * i),
                               y,
                               UI_PARAM_CHIP_W,
                               scope_trigger_param_order[i]);
     }
+#endif
 }
 
 static const char *scope_measure_channel_state_label(uint8_t idx) {
@@ -6463,170 +6681,156 @@ static void draw_scope_trace(uint16_t color,
 }
 
 #if FPGA_HW_TRIGGER
-static void ui_render_local_change(void);
-static void capture_screenshot_now(void);
-static void cycle_u8(uint8_t *value, uint8_t count, int8_t dir);
-
-// Acquisition / trigger setup (CH2 long press in scope mode), drawn like the math menu.
+// Trigger status in the top bar, as on bench scopes: state, trigger type, source colour and
+// level, then the acquisition when it is not NORMAL.
 enum {
-    SCOPE_SETUP_ACQUIRE,
-    SCOPE_SETUP_TYPE,
-    SCOPE_SETUP_PULSE,
-    SCOPE_SETUP_TIME1,
-    SCOPE_SETUP_TIME2,
-    SCOPE_SETUP_WINDOW,
-    SCOPE_SETUP_ROWS,
+    SCOPE_TRIG_STATE_STOP,
+    SCOPE_TRIG_STATE_WAIT,
+    SCOPE_TRIG_STATE_TRIGGERED,
+    SCOPE_TRIG_STATE_AUTO,
+    SCOPE_TRIG_STATE_NONE = 0xFF,
+    SCOPE_TRIG_STATUS_Y = 7,
+    SCOPE_TRIG_STATUS_GLYPH_W = 9,
+    SCOPE_TRIG_STATUS_TITLE_END = 91,       // after "OSCILLOSCOPE"
+    SCOPE_TRIG_STATUS_SHORT_TITLE_END = 49, // after "SCOPE"
 };
-static uint8_t scope_setup_menu_visible;
-static uint8_t scope_setup_selected;
-static const char *const scope_acquisition_labels[] = {"NORMAL", "PEAK DETECT"};
-static const char *const scope_trigger_type_labels[] = {"EDGE", "PULSE WIDTH", "TIMEOUT", "WINDOW"};
-static const char *const scope_pulse_cond_labels[] = {"SHORTER (<= T1)", "LONGER (> T1)", "T1 < W <= T2"};
+static const char *const scope_trig_state_labels[] = {"STOP", "WAIT", "TRIG", "AUTO"};
+static uint8_t scope_trig_state_drawn = SCOPE_TRIG_STATE_NONE;
 
-// 1-2-5 time in ns as 100NS, 20US, 5MS, 1S
-static void scope_format_trig_time(char out[12], uint32_t ns) {
-    static const char *const units[] = {"NS", "US", "MS", "S"};
-    uint8_t u = 0;
-    uint8_t n;
+// HOLD or a finished SINGLE: STOP. Free running (ROLL, X-Y, trigger source off, auto zero):
+// AUTO. Otherwise TRIG while triggered frames keep coming, then AUTO (untriggered frames in
+// AUTO mode) or WAIT (NORM / SINGLE armed).
+static uint8_t scope_trigger_state(void) {
+    uint32_t hold_ms;
 
-    while (ns >= 1000u && u < 3u) {
-        ns /= 1000u;
-        ++u;
+    if (!ui.running) {
+        return SCOPE_TRIG_STATE_STOP;
     }
-    scope_format_u32(out, ns);
-    n = scope_text_len(out);
-    scope_text_copy(&out[n], units[u], (uint8_t)(12u - n));
+    if (scope_auto_zero_active ||
+        scope_slow_roll_active() ||
+        ui.scope_display != SCOPE_DISPLAY_YT ||
+        !scope_ch_enabled[scope_trigger_source_index()]) {
+        return SCOPE_TRIG_STATE_AUTO;
+    }
+    // a capture takes one screen (12 divisions of 10 units); allow two and a second
+    hold_ms = 1000u + scope_timebase_unit_ns_value() / 100000u * SCOPE_X_DIVS * 2u;
+    if (scope_frame_valid && scope_trigger_locked && scope_frame_age_ms < hold_ms) {
+        return SCOPE_TRIG_STATE_TRIGGERED;
+    }
+    return ui.scope_trigger_mode == SCOPE_TRIGGER_AUTO ? SCOPE_TRIG_STATE_AUTO : SCOPE_TRIG_STATE_WAIT;
 }
 
-static uint8_t scope_setup_row_enabled(uint8_t row) {
-    if (row == SCOPE_SETUP_PULSE || row == SCOPE_SETUP_TIME2) {
-        return scope_trigger_type == SCOPE_HW_TYPE_PULSE &&
-               (row == SCOPE_SETUP_PULSE || scope_pulse_cond == SCOPE_HW_PULSE_RANGE);
+static uint16_t scope_trig_state_color(uint8_t state) {
+    if (state == SCOPE_TRIG_STATE_STOP) {
+        return C_WARN;
     }
-    if (row == SCOPE_SETUP_TIME1) {
-        return scope_trigger_type == SCOPE_HW_TYPE_PULSE || scope_trigger_type == SCOPE_HW_TYPE_TIMEOUT;
+    if (state == SCOPE_TRIG_STATE_TRIGGERED) {
+        return C_DMM;
     }
-    if (row == SCOPE_SETUP_WINDOW) {
-        return scope_trigger_type == SCOPE_HW_TYPE_WINDOW;
-    }
-    return 1;
+    return state == SCOPE_TRIG_STATE_WAIT ? C_TEXT : C_MUTED;
 }
 
-static void ui_draw_scope_setup_menu(void) {
-    uint16_t box_x = 50;
-    uint16_t box_y = 60;
-    uint16_t box_w = 220;
-    uint16_t box_bg = RGB565(30, 30, 45);
-    uint16_t box_h = (uint16_t)(36u + SCOPE_SETUP_ROWS * 18u + 14u);
-    uint16_t row_y = (uint16_t)(box_y + 26u);
-    const char *note = "";
-    char value_text[12];
-    char note_text[40];
+// 9 x 10 trigger type icon: rising / falling edge, pulse, timeout (edge, then the time limit)
+// and window (two levels, the signal crossing them). Pulse and timeout follow the polarity.
+static void draw_scope_trigger_glyph(uint16_t x, uint16_t y, uint8_t type, uint8_t falling, uint16_t color) {
+    uint16_t top = (uint16_t)(y + 1u);
+    uint16_t bottom = (uint16_t)(y + 8u);
+    uint16_t active = falling ? bottom : top;
+    uint16_t idle = falling ? top : bottom;
 
-    if (!scope_setup_menu_visible) {
-        return;
+    if (type == SCOPE_HW_TYPE_PULSE) {
+        lcd_rect(x, idle, 2, 1, color);
+        lcd_rect((uint16_t)(x + 2u), top, 1, 8, color);
+        lcd_rect((uint16_t)(x + 2u), active, 5, 1, color);
+        lcd_rect((uint16_t)(x + 6u), top, 1, 8, color);
+        lcd_rect((uint16_t)(x + 7u), idle, 2, 1, color);
+    } else if (type == SCOPE_HW_TYPE_TIMEOUT) {
+        lcd_rect(x, idle, 2, 1, color);
+        lcd_rect((uint16_t)(x + 2u), top, 1, 8, color);
+        lcd_rect((uint16_t)(x + 2u), active, 7, 1, color);
+        for (uint16_t row = (uint16_t)(y + 2u); row < bottom; row = (uint16_t)(row + 2u)) {
+            lcd_rect((uint16_t)(x + 8u), row, 1, 1, color);
+        }
+    } else if (type == SCOPE_HW_TYPE_WINDOW) {
+        lcd_rect(x, (uint16_t)(y + 2u), 9, 1, color);
+        lcd_rect(x, (uint16_t)(y + 7u), 9, 1, color);
+        lcd_rect((uint16_t)(x + 4u), y, 1, 10, color);
+    } else {
+        lcd_rect((uint16_t)(x + 4u), top, 1, 8, color);
+        lcd_rect(x, idle, 4, 1, color);
+        lcd_rect((uint16_t)(x + 5u), active, 4, 1, color);
+        // arrow head on the edge
+        lcd_rect((uint16_t)(x + 3u), (uint16_t)(y + (falling ? 5u : 4u)), 3, 1, color);
+        lcd_rect((uint16_t)(x + 2u), (uint16_t)(y + (falling ? 4u : 5u)), 5, 1, color);
     }
-    lcd_rect(box_x, box_y, box_w, box_h, box_bg);
-    lcd_frame(box_x, box_y, box_w, box_h, RGB565(255, 165, 0));
-    lcd_text((uint16_t)(box_x + 10u), (uint16_t)(box_y + 8u), "ACQUIRE / TRIGGER", RGB565(255, 255, 255), box_bg, 1);
-    lcd_rect((uint16_t)(box_x + 10u), (uint16_t)(box_y + 20u), (uint16_t)(box_w - 20u), 1, RGB565(100, 100, 100));
-    for (uint8_t row = 0; row < SCOPE_SETUP_ROWS; ++row) {
-        uint16_t bg = scope_setup_selected == row ? RGB565(0, 120, 240) : box_bg;
-        uint16_t fg = scope_setup_row_enabled(row) ? RGB565(255, 255, 255) : RGB565(120, 120, 120);
-        const char *label = "";
-        const char *value = value_text;
+}
 
-        if (row == SCOPE_SETUP_ACQUIRE) {
-            label = "ACQUIRE:";
-            value = scope_acquisition_labels[scope_acquisition ? 1u : 0u];
-            if (scope_acquisition && !scope_peak_possible()) {
-                fg = RGB565(120, 120, 120);
-                note = FPGA_FAST_CLOCK_HZ > 50000000u ? "PEAK: Y-T, 1US/DIV AND SLOWER" : "PEAK: Y-T, 2US/DIV AND SLOWER";
-            }
-        } else if (row == SCOPE_SETUP_TYPE) {
-            label = "TRIG TYPE:";
-            value = scope_trigger_type_labels[scope_trigger_type & 3u];
-        } else if (row == SCOPE_SETUP_PULSE) {
-            label = "PULSE:";
-            value = scope_pulse_cond_labels[scope_pulse_cond < 3u ? scope_pulse_cond : 0u];
-        } else if (row == SCOPE_SETUP_TIME1 || row == SCOPE_SETUP_TIME2) {
-            uint8_t t = row == SCOPE_SETUP_TIME2 ? 1u : 0u;
-            label = t ? "TIME 2 (T2):" : "TIME 1 (T1):";
-            scope_format_trig_time(value_text, scope_trig_times_ns[scope_trig_time_idx[t] % SCOPE_TRIG_TIME_COUNT]);
-            if (scope_setup_selected == row && scope_setup_row_enabled(row)) {
-                // what the FPGA counts: samples of the current timebase
-                char number[11];
-                scope_format_u32(number, scope_trig_samples(t));
-                scope_text_copy(note_text, "= ", sizeof(note_text));
-                ui_text_append(note_text, number, sizeof(note_text));
-                ui_text_append(note_text, " SAMPLES AT THIS TIME/DIV", sizeof(note_text));
-                note = note_text;
-            }
+static const char *scope_acquisition_badge(void) {
+    return scope_acquisition == SCOPE_HW_ACQ_PEAK ? "PEAK" : 0;
+}
+
+// Drawn after the micro status and the status icons; shortens the title when it needs room.
+static void draw_scope_trigger_status(uint16_t bg) {
+    uint8_t state = scope_trigger_state();
+    uint16_t right = (uint16_t)(ui_status_icons_x + 26u);
+    const char *level = scope_trigger_level_label();
+    const char *badge = scope_acquisition_badge();
+    uint16_t level_w;
+    uint16_t badge_w;
+    uint16_t width;
+    uint16_t x;
+
+    scope_trig_state_drawn = state;
+    if (level[0] == '+') {
+        ++level;
+    }
+    level_w = lcd_text_width(level, 1);
+    badge_w = badge ? (uint16_t)(lcd_text_width(badge, 1) + 6u) : 0u;
+    for (uint8_t fit = 0; fit < 4u; ++fit) {
+        width = (uint16_t)(24u + 4u + SCOPE_TRIG_STATUS_GLYPH_W + 3u + level_w + (badge_w ? badge_w + 4u : 0u));
+        if (width + SCOPE_TRIG_STATUS_TITLE_END <= right) {
+            break;
+        }
+        if (width + SCOPE_TRIG_STATUS_SHORT_TITLE_END <= right) {
+            lcd_rect(13, 10, 72, 8, bg);
+            lcd_text(13, 10, "SCOPE", C_TEXT, bg, 1);
+            break;
+        }
+        // still no room (many status icons): drop the badge, then the level, then everything
+        if (badge_w) {
+            badge_w = 0;
+        } else if (level_w) {
+            level_w = 0;
         } else {
-            label = "WIN HIGH:";
-            scope_format_signed_mv(value_text, scope_raw_delta_mv(scope_trigger_source_index(), scope_window_high));
-            if (scope_setup_selected == row && scope_setup_row_enabled(row)) {
-                note = "WINDOW LOW = TRIGGER LEVEL";
-            }
+            return;
         }
-        lcd_rect((uint16_t)(box_x + 8u), row_y, (uint16_t)(box_w - 16u), 14, bg);
-        lcd_text((uint16_t)(box_x + 12u), (uint16_t)(row_y + 3u), label, fg, bg, 1);
-        lcd_text((uint16_t)(box_x + 96u), (uint16_t)(row_y + 3u), value, fg, bg, 1);
-        row_y = (uint16_t)(row_y + 18u);
     }
-    lcd_text((uint16_t)(box_x + 12u), (uint16_t)(row_y + 2u), note, RGB565(160, 160, 160), box_bg, 1);
-}
-
-static void scope_setup_adjust(int8_t dir) {
-    if (scope_setup_selected == SCOPE_SETUP_ACQUIRE) {
-        scope_acquisition = scope_acquisition ? SCOPE_HW_ACQ_NORMAL : SCOPE_HW_ACQ_PEAK;
-    } else if (scope_setup_selected == SCOPE_SETUP_TYPE) {
-        cycle_u8(&scope_trigger_type, 4u, dir);
-    } else if (!scope_setup_row_enabled(scope_setup_selected)) {
+    if (width + SCOPE_TRIG_STATUS_SHORT_TITLE_END > right) {
         return;
-    } else if (scope_setup_selected == SCOPE_SETUP_PULSE) {
-        cycle_u8(&scope_pulse_cond, 3u, dir);
-    } else if (scope_setup_selected == SCOPE_SETUP_TIME1 || scope_setup_selected == SCOPE_SETUP_TIME2) {
-        uint8_t *idx = &scope_trig_time_idx[scope_setup_selected == SCOPE_SETUP_TIME2 ? 1u : 0u];
-        if (dir > 0 && *idx + 1u < SCOPE_TRIG_TIME_COUNT) {
-            ++*idx;
-        } else if (dir < 0 && *idx > 0u) {
-            --*idx;
-        }
-    } else {
-        int16_t next = (int16_t)scope_window_high + dir * 4;
-        scope_window_high = (uint8_t)(next < 12 ? 12 : next > 243 ? 243 : next);
     }
-    scope_trigger_locked = 0;
-    scope_trace_invalidate();
-}
+    x = (uint16_t)(right - width);
+    lcd_rect(x, 6, width, 13, bg);
+    lcd_text(x, (uint16_t)(SCOPE_TRIG_STATUS_Y + 1u), scope_trig_state_labels[state],
+             scope_trig_state_color(state), bg, 1);
+    x = (uint16_t)(x + 28u);
+    draw_scope_trigger_glyph(x,
+                             SCOPE_TRIG_STATUS_Y,
+                             scope_trigger_type,
+                             ui.scope_trigger_edge,
+                             scope_channel_color(ui.scope_trigger_source));
+    x = (uint16_t)(x + SCOPE_TRIG_STATUS_GLYPH_W + 3u);
+    if (level_w) {
+        lcd_text(x, (uint16_t)(SCOPE_TRIG_STATUS_Y + 1u), level,
+                 scope_channel_color(ui.scope_trigger_source), bg, 1);
+        x = (uint16_t)(x + level_w);
+    }
+    if (badge_w) {
+        uint16_t color = scope_peak_possible() ? C_GEN : C_MUTED;
 
-static uint8_t ui_handle_keys_scope_setup_menu(uint32_t events) {
-    if (!scope_setup_menu_visible) {
-        return 0;
+        x = (uint16_t)(x + 4u);
+        lcd_frame(x, SCOPE_TRIG_STATUS_Y, badge_w, 10, color);
+        lcd_text((uint16_t)(x + 3u), (uint16_t)(SCOPE_TRIG_STATUS_Y + 1u), badge, color, bg, 1);
     }
-    if (ui.mode != UI_MODE_SCOPE || ui.overlay != UI_OVERLAY_NONE) {
-        scope_setup_menu_visible = 0;
-        return 0;
-    }
-    if (events & KEY_SAVE_LONG) {
-        capture_screenshot_now();
-        return 1;
-    }
-    if (events & (KEY_MENU | KEY_CH2_LONG)) {
-        scope_setup_menu_visible = 0;
-    } else if (events & KEY_UP) {
-        scope_setup_selected = scope_setup_selected ? (uint8_t)(scope_setup_selected - 1u) :
-                                                      (uint8_t)(SCOPE_SETUP_ROWS - 1u);
-    } else if (events & KEY_DOWN) {
-        scope_setup_selected = (uint8_t)((scope_setup_selected + 1u) % SCOPE_SETUP_ROWS);
-    } else if (events & (KEY_LEFT | KEY_RIGHT | KEY_OK)) {
-        scope_setup_adjust((events & KEY_LEFT) ? -1 : 1);
-    } else {
-        return 1;
-    }
-    ui_render_local_change();
-    return 1;
 }
 #endif
 
@@ -6791,6 +6995,9 @@ static void draw_scope_immersive(void) {
     lcd_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, grid_bg);
     draw_micro_status(6, 6, grid_bg);
     draw_battery_status_overlay(grid_bg);
+#if FPGA_HW_TRIGGER
+    draw_scope_trigger_status(grid_bg);
+#endif
 
 #if SCOPE_UI_SAFE_STUB
     scope_sanitize_state();
@@ -6877,9 +7084,6 @@ static void draw_scope_immersive(void) {
 
     draw_scope_scale_status(220, grid_bg);
     ui_draw_math_menu();
-#if FPGA_HW_TRIGGER
-    ui_draw_scope_setup_menu();
-#endif
 }
 
 static uint8_t gen_clamped_duty(void) {
@@ -7820,6 +8024,9 @@ static void ui_draw_battery_status_scene(void) {
         draw_battery_status_header();
     } else if (ui.mode == UI_MODE_SCOPE) {
         draw_battery_status_overlay(RGB565(4, 8, 11));
+#if FPGA_HW_TRIGGER
+        draw_scope_trigger_status(RGB565(4, 8, 11));
+#endif
     } else {
         draw_battery_status_overlay(C_BG);
     }
@@ -8612,6 +8819,14 @@ void ui_note_runtime_settings(void) {
     ui_settings.bode_start_hz = bode_start_hz;
     ui_settings.bode_stop_hz = bode_stop_hz;
     ui_settings.bode_steps = bode_steps;
+#if FPGA_HW_TRIGGER
+    ui_settings.scope_trigger_type = scope_trigger_type;
+    ui_settings.scope_pulse_cond = scope_pulse_cond;
+    ui_settings.scope_trigger_time[0] = scope_trig_time_idx[0];
+    ui_settings.scope_trigger_time[1] = scope_trig_time_idx[1];
+    ui_settings.scope_window_high = scope_window_high;
+    ui_settings.scope_acquisition = scope_acquisition;
+#endif
 
     for (uint8_t ch = 0; ch < 2u; ++ch) {
         ui_settings.scope_ch_enabled[ch] = scope_ch_enabled[ch] ? 1u : 0u;
@@ -9041,9 +9256,15 @@ static void scope_step_param(int8_t dir) {
                                (uint8_t)sizeof(scope_channel_param_order),
                                dir);
     } else if (ui.scope_trigger_menu) {
+#if FPGA_HW_TRIGGER
+        uint8_t rows[SCOPE_TRIGGER_ROWS_MAX];
+
+        scope_step_param_order(rows, scope_trigger_rows(rows), dir);
+#else
         scope_step_param_order(scope_trigger_param_order,
                                (uint8_t)sizeof(scope_trigger_param_order),
                                dir);
+#endif
     } else {
         scope_step_param_order(scope_global_param_order,
                                (uint8_t)sizeof(scope_global_param_order),
@@ -9118,6 +9339,14 @@ static void ui_apply_saved_runtime_settings(void) {
     scope_measure_visible = ui_settings.scope_measure_visible;
     scope_h_value_pos = ui_settings.scope_h_value_pos;
     scope_h_value_timebase = ui_settings.scope_h_value_timebase;
+#if FPGA_HW_TRIGGER
+    scope_trigger_type = ui_settings.scope_trigger_type;
+    scope_pulse_cond = ui_settings.scope_pulse_cond;
+    scope_trig_time_idx[0] = ui_settings.scope_trigger_time[0];
+    scope_trig_time_idx[1] = ui_settings.scope_trigger_time[1];
+    scope_window_high = ui_settings.scope_window_high;
+    scope_acquisition = ui_settings.scope_acquisition;
+#endif
 
     for (uint8_t ch = 0; ch < 2u; ++ch) {
         scope_ch_enabled[ch] = ui_settings.scope_ch_enabled[ch];
@@ -9449,6 +9678,45 @@ static void scope_toggle_trigger_edge(void) {
     scope_trace_invalidate();
 }
 
+#if FPGA_HW_TRIGGER
+static void scope_adjust_window_high_steps(int8_t dir, uint8_t step) {
+    int16_t next = (int16_t)scope_window_high + (int16_t)(dir * step);
+
+    if (next < 12) {
+        next = 12;
+    } else if (next > 243) {
+        next = 243;
+    }
+    scope_window_high = (uint8_t)next;
+    scope_trigger_locked = 0;
+    scope_roll_trigger_reset();
+    scope_trace_invalidate();
+}
+
+// TYPE, WIDTH, T1, T2 and HIGH chips of the trigger menu.
+static void scope_adjust_trigger_setting(uint8_t param, int8_t dir) {
+    if (param == SCOPE_PARAM_TRIG_KIND) {
+        cycle_u8(&scope_trigger_type, 4u, dir);
+    } else if (param == SCOPE_PARAM_TRIG_WIDTH) {
+        cycle_u8(&scope_pulse_cond, 3u, dir);
+    } else if (param == SCOPE_PARAM_TRIG_T1 || param == SCOPE_PARAM_TRIG_T2) {
+        uint8_t *idx = &scope_trig_time_idx[param == SCOPE_PARAM_TRIG_T2 ? 1u : 0u];
+
+        if (dir > 0 && *idx + 1u < SCOPE_TRIG_TIME_COUNT) {
+            ++*idx;
+        } else if (dir < 0 && *idx > 0u) {
+            --*idx;
+        }
+    } else if (param == SCOPE_PARAM_TRIG_HIGH) {
+        scope_adjust_window_high_steps(dir, 1);
+        return;
+    }
+    scope_trigger_locked = 0;
+    scope_roll_trigger_reset();
+    scope_trace_invalidate();
+}
+#endif
+
 static void scope_step_measure_param(int8_t dir) {
     cycle_u8(&scope_measure_param, SCOPE_MEASURE_COUNT, dir);
 }
@@ -9483,6 +9751,13 @@ static void scope_close_measure_menu(void) {
 static void scope_open_trigger_menu(uint8_t param) {
     scope_clear_menus();
     ui.scope_trigger_menu = 1;
+#if FPGA_HW_TRIGGER
+    // the menu opens on its first chip, TYPE
+    if (param == SCOPE_PARAM_TRIG_TYPE) {
+        param = SCOPE_PARAM_TRIG_KIND;
+    }
+    scope_trigger_row_first = 0;
+#endif
     if (!scope_param_is_trigger(param)) {
         param = SCOPE_PARAM_TRIG_TYPE;
     }
@@ -9932,6 +10207,10 @@ static void scope_adjust_selected_param(int8_t dir) {
         scope_toggle_trigger_edge();
     } else if (ui.scope_param == SCOPE_PARAM_MEASURE) {
         scope_step_measure_param(dir);
+#if FPGA_HW_TRIGGER
+    } else if (ui.scope_param >= SCOPE_PARAM_TRIG_KIND && ui.scope_param <= SCOPE_PARAM_TRIG_HIGH) {
+        scope_adjust_trigger_setting(ui.scope_param, dir);
+#endif
     } else if (ui.scope_cursor_mode == SCOPE_CURSOR_LEVEL) {
         scope_adjust_cursor(dir);
     } else {
@@ -10333,6 +10612,12 @@ static void ui_handle_vertical_key(int8_t screen_dir, uint8_t repeat) {
                ui.scope_trigger_menu &&
                ui.scope_param == SCOPE_PARAM_TRIG_LEVEL) {
         scope_adjust_trigger_level_key((int8_t)-screen_dir, repeat);
+#if FPGA_HW_TRIGGER
+    } else if (ui.mode == UI_MODE_SCOPE &&
+               ui.scope_trigger_menu &&
+               ui.scope_param == SCOPE_PARAM_TRIG_HIGH) {
+        scope_adjust_window_high_steps(screen_dir, repeat ? 3u : 1u);
+#endif
     } else {
         adjust_current((int8_t)-screen_dir, repeat);
     }
@@ -10809,6 +11094,12 @@ static uint8_t ui_handle_keys_math_menu(uint32_t events) {
                 scope_hide_traces = (uint8_t)((scope_hide_traces + step + 4) % 4);
                 break;
 
+#if FPGA_HW_TRIGGER
+            case MENU_ITEM_ACQUIRE:
+                scope_cycle_acquisition(step);
+                break;
+#endif
+
             case MENU_ITEM_BODE_STEPS:
                 break;
         }
@@ -10855,11 +11146,6 @@ static uint8_t scope_fpga_diag_handle_keys(uint32_t events) {
     if (ui.mode != UI_MODE_SCOPE || scope_any_menu_open() || ui_math_menu_visible) {
         return 0;
     }
-#if FPGA_HW_TRIGGER
-    if (scope_setup_menu_visible) {
-        return 0;
-    }
-#endif
     if (events & KEY_SAVE) {
         scope_fpga_diag_active = (uint8_t)!scope_fpga_diag_active;
         scope_fpga_diag_ms = 0;
@@ -10891,20 +11177,6 @@ void ui_handle_keys(uint32_t events) {
     if (ui_math_menu_visible && ui_handle_keys_math_menu(events)) {
         return;
     }
-#if FPGA_HW_TRIGGER
-    if (ui_handle_keys_scope_setup_menu(events)) {
-        return;
-    }
-    if ((events & KEY_CH2_LONG) &&
-        ui.mode == UI_MODE_SCOPE &&
-        ui.overlay == UI_OVERLAY_NONE &&
-        !scope_any_menu_open() &&
-        !ui_math_menu_visible) {
-        scope_setup_menu_visible = 1;
-        ui_render_local_change();
-        return;
-    }
-#endif
 
     if (ui_math_menu_visible && (ui.mode != UI_MODE_SCOPE || ui.overlay != UI_OVERLAY_NONE)) {
         ui_math_menu_visible = 0;
@@ -11051,7 +11323,7 @@ void ui_handle_keys(uint32_t events) {
             scope_select_or_advance_param(SCOPE_PARAM_ENABLE);
             ui_render_local_change();
         } else if (ui.mode == UI_MODE_SCOPE && ui.scope_trigger_menu) {
-            scope_select_or_advance_param(SCOPE_PARAM_TRIG_SOURCE);
+            scope_select_or_advance_param(scope_trigger_slot_param(0, SCOPE_PARAM_TRIG_SOURCE));
             ui_render_local_change();
         } else {
             primary_action();
@@ -11074,7 +11346,7 @@ void ui_handle_keys(uint32_t events) {
             scope_select_or_advance_param(SCOPE_PARAM_PROBE);
             ui_render_local_change();
         } else if (ui.mode == UI_MODE_SCOPE && ui.scope_trigger_menu) {
-            scope_select_or_advance_param(SCOPE_PARAM_TRIG_EDGE);
+            scope_select_or_advance_param(scope_trigger_slot_param(1, SCOPE_PARAM_TRIG_EDGE));
             ui_render_local_change();
         } else if (ui.mode == UI_MODE_SCOPE && ui.scope_cursor_menu) {
             scope_close_cursor_menu();
@@ -11219,7 +11491,7 @@ void ui_handle_keys(uint32_t events) {
             scope_select_or_advance_param(SCOPE_PARAM_GAIN);
             ui_render_local_change();
         } else if (ui.scope_trigger_menu) {
-            scope_select_or_advance_param(SCOPE_PARAM_TRIG_LEVEL);
+            scope_select_or_advance_param(scope_trigger_slot_param(3, SCOPE_PARAM_TRIG_LEVEL));
             ui_render_local_change();
         } else {
             scope_open_measure_menu();
@@ -11632,6 +11904,14 @@ void ui_tick(uint32_t elapsed_ms) {
         } else {
             scope_fpga_diag_ms = (uint16_t)diag_next;
         }
+    }
+#endif
+#if FPGA_HW_TRIGGER
+    // The trigger status also changes without a new frame (TRIG -> WAIT, STOP).
+    if (ui.mode == UI_MODE_SCOPE && ui.overlay == UI_OVERLAY_NONE && !ui.chrome_visible &&
+        !rendered && scope_trigger_state() != scope_trig_state_drawn) {
+        ui_render_scope_frame();
+        rendered = 1;
     }
 #endif
 

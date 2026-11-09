@@ -53,6 +53,10 @@ uint8_t scope_hw_trigger_position(uint16_t *pre_samples) {
     return 1;
 }
 
+// scope_adjust_selected_param reaches the V/DIV path, which re-arms the capture.
+void scope_hw_arm(void) {
+}
+
 static void setup(void) {
     ui.scope_display = SCOPE_DISPLAY_YT;
     ui.scope_timebase = 11u;
@@ -292,15 +296,159 @@ static void test_trigger_types(void) {
     assert(strcmp(out, "500MS") == 0);
     scope_format_trig_time(out, 2000000000u);
     assert(strcmp(out, "2S") == 0);
-    // menu rows: only the ones that apply can be changed
-    scope_setup_selected = SCOPE_SETUP_WINDOW;
-    scope_setup_adjust(1);
-    assert(scope_window_high == 200u);
-    scope_trigger_type = SCOPE_HW_TYPE_WINDOW;
-    scope_setup_adjust(1);
-    assert(scope_window_high == 204u);
     scope_trigger_type = SCOPE_HW_TYPE_EDGE;
     scope_trig_time_idx[0] = SCOPE_TRIG_TIME_DEFAULT_1;
+}
+
+static void expect_rows(const uint8_t *expected, uint8_t count) {
+    uint8_t rows[SCOPE_TRIGGER_ROWS_MAX];
+
+    assert(scope_trigger_rows(rows) == count);
+    assert(memcmp(rows, expected, count) == 0);
+}
+
+// Trigger menu: TYPE first, only the chips of the current type, four on screen.
+static void test_trigger_menu(void) {
+    static const uint8_t edge[] = {SCOPE_PARAM_TRIG_KIND, SCOPE_PARAM_TRIG_SOURCE, SCOPE_PARAM_TRIG_EDGE,
+                                   SCOPE_PARAM_TRIG_LEVEL, SCOPE_PARAM_TRIG_TYPE};
+    static const uint8_t pulse[] = {SCOPE_PARAM_TRIG_KIND, SCOPE_PARAM_TRIG_SOURCE, SCOPE_PARAM_TRIG_EDGE,
+                                    SCOPE_PARAM_TRIG_LEVEL, SCOPE_PARAM_TRIG_WIDTH, SCOPE_PARAM_TRIG_T1,
+                                    SCOPE_PARAM_TRIG_TYPE};
+    static const uint8_t range[] = {SCOPE_PARAM_TRIG_KIND, SCOPE_PARAM_TRIG_SOURCE, SCOPE_PARAM_TRIG_EDGE,
+                                    SCOPE_PARAM_TRIG_LEVEL, SCOPE_PARAM_TRIG_WIDTH, SCOPE_PARAM_TRIG_T1,
+                                    SCOPE_PARAM_TRIG_T2, SCOPE_PARAM_TRIG_TYPE};
+    static const uint8_t timeout[] = {SCOPE_PARAM_TRIG_KIND, SCOPE_PARAM_TRIG_SOURCE, SCOPE_PARAM_TRIG_EDGE,
+                                      SCOPE_PARAM_TRIG_LEVEL, SCOPE_PARAM_TRIG_T1, SCOPE_PARAM_TRIG_TYPE};
+    static const uint8_t window[] = {SCOPE_PARAM_TRIG_KIND, SCOPE_PARAM_TRIG_SOURCE, SCOPE_PARAM_TRIG_LEVEL,
+                                     SCOPE_PARAM_TRIG_HIGH, SCOPE_PARAM_TRIG_TYPE};
+
+    setup();
+    scope_trigger_type = SCOPE_HW_TYPE_EDGE;
+    scope_pulse_cond = SCOPE_HW_PULSE_GT;
+    expect_rows(edge, sizeof(edge));
+    scope_open_trigger_menu(SCOPE_PARAM_TRIG_TYPE);
+    assert(ui.scope_trigger_menu && ui.scope_param == SCOPE_PARAM_TRIG_KIND);
+    assert(strcmp(scope_param_label(SCOPE_PARAM_TRIG_EDGE), "EDGE") == 0);
+    assert(strcmp(scope_param_value(SCOPE_PARAM_TRIG_EDGE), "RISE") == 0);
+    // F1 F2 F4 sit over TYPE SRC LEVEL; MODE scrolls in from the right
+    assert(scope_trigger_slot_param(0, 0) == SCOPE_PARAM_TRIG_KIND);
+    assert(scope_trigger_slot_param(1, 0) == SCOPE_PARAM_TRIG_SOURCE);
+    assert(scope_trigger_slot_param(3, 0) == SCOPE_PARAM_TRIG_LEVEL);
+    for (uint8_t i = 0; i < 4u; ++i) {
+        scope_step_param(1);
+    }
+    assert(ui.scope_param == SCOPE_PARAM_TRIG_TYPE);
+    assert(scope_trigger_slot_param(0, 0) == SCOPE_PARAM_TRIG_SOURCE);
+    assert(scope_trigger_slot_param(3, 0) == SCOPE_PARAM_TRIG_TYPE);
+    scope_step_param(1);
+    assert(ui.scope_param == SCOPE_PARAM_TRIG_KIND);
+    assert(scope_trigger_slot_param(0, 0) == SCOPE_PARAM_TRIG_KIND);
+
+    // TYPE: up/down cycles EDGE, PULSE, TIMEOUT, WINDOW
+    scope_adjust_selected_param(1);
+    assert(scope_trigger_type == SCOPE_HW_TYPE_PULSE);
+    assert(strcmp(scope_param_value(SCOPE_PARAM_TRIG_KIND), "PULSE") == 0);
+    assert(strcmp(scope_param_label(SCOPE_PARAM_TRIG_EDGE), "POL") == 0);
+    assert(strcmp(scope_param_value(SCOPE_PARAM_TRIG_EDGE), "POS") == 0);
+    expect_rows(pulse, sizeof(pulse));
+    ui.scope_param = SCOPE_PARAM_TRIG_WIDTH;
+    assert(strcmp(scope_param_value(SCOPE_PARAM_TRIG_WIDTH), "LONG") == 0);
+    scope_adjust_selected_param(1);
+    assert(scope_pulse_cond == SCOPE_HW_PULSE_RANGE);
+    assert(strcmp(scope_param_value(SCOPE_PARAM_TRIG_WIDTH), "RANGE") == 0);
+    expect_rows(range, sizeof(range));
+    ui.scope_param = SCOPE_PARAM_TRIG_T2;
+    scope_trig_time_idx[1] = SCOPE_TRIG_TIME_DEFAULT_2;
+    assert(strcmp(scope_param_value(SCOPE_PARAM_TRIG_T2), "10MS") == 0);
+    scope_adjust_selected_param(1);
+    assert(strcmp(scope_param_value(SCOPE_PARAM_TRIG_T2), "20MS") == 0);
+    ui.scope_param = SCOPE_PARAM_TRIG_T1;
+    scope_trig_time_idx[0] = 0;
+    scope_adjust_selected_param(-1);
+    assert(scope_trig_time_idx[0] == 0 && strcmp(scope_param_value(SCOPE_PARAM_TRIG_T1), "100NS") == 0);
+    scope_trig_time_idx[0] = SCOPE_TRIG_TIME_COUNT - 1u;
+    scope_adjust_selected_param(1);
+    assert(scope_trig_time_idx[0] == SCOPE_TRIG_TIME_COUNT - 1u);
+    assert(scope_trigger_slot_param(3, 0) == SCOPE_PARAM_TRIG_T1);
+    ui.scope_param = SCOPE_PARAM_TRIG_KIND;
+    scope_adjust_selected_param(1);
+    assert(scope_trigger_type == SCOPE_HW_TYPE_TIMEOUT);
+    expect_rows(timeout, sizeof(timeout));
+    scope_adjust_selected_param(1);
+    assert(scope_trigger_type == SCOPE_HW_TYPE_WINDOW);
+    expect_rows(window, sizeof(window));
+    assert(strcmp(scope_param_label(SCOPE_PARAM_TRIG_LEVEL), "LOW") == 0);
+    assert(scope_trigger_slot_param(3, 0) == SCOPE_PARAM_TRIG_HIGH);
+    // window high: like LEVEL, never outside the codes the comparator uses
+    ui.scope_param = SCOPE_PARAM_TRIG_HIGH;
+    scope_window_high = 242u;
+    scope_adjust_selected_param(1);
+    scope_adjust_selected_param(1);
+    assert(scope_window_high == 243u);
+    // chips that left with a type change are not kept selected
+    scope_trigger_type = SCOPE_HW_TYPE_EDGE;
+    scope_sanitize_state();
+    assert(ui.scope_param == SCOPE_PARAM_TRIG_TYPE);
+    scope_trigger_type = SCOPE_HW_TYPE_EDGE;
+    scope_pulse_cond = SCOPE_HW_PULSE_GT;
+    scope_trig_time_idx[0] = SCOPE_TRIG_TIME_DEFAULT_1;
+    scope_trig_time_idx[1] = SCOPE_TRIG_TIME_DEFAULT_2;
+    scope_window_high = 192u;
+    scope_clear_menus();
+}
+
+// ACQUIRE lives in the CH1 long press menu; the trigger status sits in the top bar.
+static void test_acquire_and_status(void) {
+    uint8_t rows = sizeof(math_menu_order) / sizeof(math_menu_order[0]);
+
+    setup();
+    assert(math_menu_order[rows - 1u] == MENU_ITEM_ACQUIRE);
+    scope_acquisition = SCOPE_HW_ACQ_NORMAL;
+    scope_cycle_acquisition(1);
+    assert(scope_acquisition == SCOPE_HW_ACQ_PEAK);
+    scope_cycle_acquisition(1);
+    assert(scope_acquisition == SCOPE_HW_ACQ_NORMAL);
+    scope_cycle_acquisition(-1);
+    assert(scope_acquisition == SCOPE_HW_ACQ_PEAK);
+    scope_acquisition = SCOPE_HW_ACQ_NORMAL;
+
+    setup();
+    ui.running = 1;
+    scope_frame_valid = 1;
+    scope_frame_age_ms = 0;
+    scope_trigger_locked = 1;
+    assert(scope_trigger_state() == SCOPE_TRIG_STATE_TRIGGERED);
+    scope_frame_age_ms = 5000u;
+    assert(scope_trigger_state() == SCOPE_TRIG_STATE_WAIT);
+    ui.scope_trigger_mode = SCOPE_TRIGGER_AUTO;
+    assert(scope_trigger_state() == SCOPE_TRIG_STATE_AUTO);
+    scope_frame_age_ms = 0;
+    scope_trigger_locked = 0;
+    assert(scope_trigger_state() == SCOPE_TRIG_STATE_AUTO);
+    ui.scope_trigger_mode = SCOPE_TRIGGER_SINGLE;
+    assert(scope_trigger_state() == SCOPE_TRIG_STATE_WAIT);
+    ui.running = 0;
+    assert(scope_trigger_state() == SCOPE_TRIG_STATE_STOP);
+    ui.running = 1;
+    ui.scope_display = SCOPE_DISPLAY_XY;
+    assert(scope_trigger_state() == SCOPE_TRIG_STATE_AUTO);
+    ui.scope_display = SCOPE_DISPLAY_YT;
+    // slow timebases: a capture alone takes longer than a second
+    ui.scope_timebase = 20u;                                  // 200MS, the slowest block capture
+    scope_trigger_locked = 1;
+    scope_frame_age_ms = 5000u;
+    assert(scope_trigger_state() == SCOPE_TRIG_STATE_TRIGGERED);
+    scope_frame_age_ms = 6000u;
+    assert(scope_trigger_state() == SCOPE_TRIG_STATE_WAIT);
+    // slow roll has no trigger: free running
+    ui.scope_timebase = SCOPE_SLOW_ROLL_TIMEBASE_START;
+    assert(scope_trigger_state() == SCOPE_TRIG_STATE_AUTO);
+    scope_trigger_locked = 0;
+    scope_frame_valid = 0;
+    assert(strcmp(scope_acquisition_badge() ? scope_acquisition_badge() : "", "") == 0);
+    scope_acquisition = SCOPE_HW_ACQ_PEAK;
+    assert(strcmp(scope_acquisition_badge(), "PEAK") == 0);
+    scope_acquisition = SCOPE_HW_ACQ_NORMAL;
 }
 
 int main(void) {
@@ -310,6 +458,8 @@ int main(void) {
     test_peak_measurements();
     test_counter_readout();
     test_trigger_types();
+    test_trigger_menu();
+    test_acquire_and_status();
     puts("scope hardware trigger mapping, peak detect, counter readout and trigger type tests passed");
     return 0;
 }

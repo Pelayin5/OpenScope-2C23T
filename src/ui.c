@@ -299,6 +299,24 @@ static uint8_t scope_frame_valid;
 // peak capture (pair 2k = group minimum, pair 2k+1 = group maximum).
 static uint8_t scope_acquisition;
 static uint8_t scope_capture_peak;
+#if FPGA_HW_TRIGGER
+// Trigger types of the open HW4 bitstream (ACQUIRE / TRIGGER menu): times in a 1-2-5 list,
+// converted to samples of the current timebase when sent to the FPGA.
+static const uint32_t scope_trig_times_ns[] = {
+    100u, 200u, 500u, 1000u, 2000u, 5000u, 10000u, 20000u, 50000u,
+    100000u, 200000u, 500000u, 1000000u, 2000000u, 5000000u, 10000000u, 20000000u,
+    50000000u, 100000000u, 200000000u, 500000000u, 1000000000u, 2000000000u,
+};
+enum {
+    SCOPE_TRIG_TIME_COUNT = sizeof(scope_trig_times_ns) / sizeof(scope_trig_times_ns[0]),
+    SCOPE_TRIG_TIME_DEFAULT_1 = 12, // 1 ms
+    SCOPE_TRIG_TIME_DEFAULT_2 = 15, // 10 ms
+};
+static uint8_t scope_trigger_type = SCOPE_HW_TYPE_EDGE;
+static uint8_t scope_pulse_cond = SCOPE_HW_PULSE_GT;
+static uint8_t scope_trig_time_idx[2] = {SCOPE_TRIG_TIME_DEFAULT_1, SCOPE_TRIG_TIME_DEFAULT_2};
+static uint8_t scope_window_high = 192u;
+#endif
 static uint16_t scope_frame_id;
 static uint8_t scope_min_raw[2];
 static uint8_t scope_max_raw[2];
@@ -4672,6 +4690,24 @@ static uint8_t scope_peak_possible(void) {
 static uint8_t scope_peak_active(void) {
     return scope_acquisition == SCOPE_HW_ACQ_PEAK && scope_peak_possible();
 }
+
+// Trigger time i (0: TIME 1 = X, 1: TIME 2 = Y) in samples of the current timebase, >= 1.
+static uint16_t scope_trig_samples(uint8_t i) {
+    uint32_t period = scope_sample_period_ns();
+    uint32_t t = scope_trig_times_ns[scope_trig_time_idx[i ? 1u : 0u] % SCOPE_TRIG_TIME_COUNT];
+    uint32_t n;
+
+    if (!period) {
+        period = 1u;
+    }
+    n = t / period + ((t % period) >= period / 2u ? 1u : 0u);
+    if (n < 1u) {
+        n = 1u;
+    } else if (n > 0xFFFFu) {
+        n = 0xFFFFu;
+    }
+    return (uint16_t)n;
+}
 #endif
 
 // Hardware trigger (open HW4 bitstream): the trigger sample lands at the window position the
@@ -4700,6 +4736,11 @@ static void scope_hw_trigger_sync(void) {
     trigger.level = ui.scope_trigger_level;
     trigger.pre_samples = pre;
     trigger.acquisition = scope_peak_active() ? SCOPE_HW_ACQ_PEAK : SCOPE_HW_ACQ_NORMAL;
+    trigger.type = scope_trigger_type;
+    trigger.pulse = scope_pulse_cond;
+    trigger.width_lo = scope_trig_samples(0);
+    trigger.width_hi = scope_trig_samples(1);
+    trigger.level_high = scope_window_high;
     scope_hw_set_trigger(&trigger);
 #endif
 }
@@ -4846,8 +4887,10 @@ static uint8_t scope_poll_frame(void) {
         scope_ch_enabled[scope_trigger_source_index()]) {
         trigger_found = scope_hw_trigger_offset(&trigger_offset);
 #if FPGA_HW_TRIGGER
-        // A peak capture alternates group minima and maxima: only the FPGA trigger applies.
-        if (!trigger_found && scope_hw_capture_acquisition() != SCOPE_HW_ACQ_PEAK) {
+        // A peak capture alternates group minima and maxima, and pulse, timeout and window
+        // triggers have no software equivalent: only the FPGA trigger applies.
+        if (!trigger_found && scope_hw_capture_acquisition() != SCOPE_HW_ACQ_PEAK &&
+            scope_trigger_type == SCOPE_HW_TYPE_EDGE) {
 #else
         if (!trigger_found) {
 #endif
@@ -5982,6 +6025,13 @@ static void draw_scope_trigger_line(uint16_t gx, uint16_t gy, uint16_t gw, uint1
     char level[11];
     char edge[2] = {ui.scope_trigger_edge ? 'F' : 'R', 0};
     int32_t mv = scope_raw_delta_mv(src, ui.scope_trigger_level);
+#if FPGA_HW_TRIGGER
+    static const char type_marks[] = {0, 'P', 'T', 'W'};
+
+    if (scope_trigger_type != SCOPE_HW_TYPE_EDGE && scope_trigger_type <= SCOPE_HW_TYPE_WINDOW) {
+        edge[0] = type_marks[scope_trigger_type];
+    }
+#endif
     int16_t center;
     int16_t delta;
     int16_t amp = ui.chrome_visible ? 48 : 64;
@@ -6014,6 +6064,28 @@ static void draw_scope_trigger_line(uint16_t gx, uint16_t gy, uint16_t gw, uint1
              color,
              bg,
              1);
+#if FPGA_HW_TRIGGER
+    // window: the high level as a second, sparser line
+    if (scope_trigger_type == SCOPE_HW_TYPE_WINDOW) {
+        delta = (int16_t)scope_window_high - 128;
+        y = (int16_t)(center - (delta * amp) / 96);
+        if (y < (int16_t)(gy + 1u)) {
+            y = (int16_t)(gy + 1u);
+        } else if (y > (int16_t)(gy + gh - 2u)) {
+            y = (int16_t)(gy + gh - 2u);
+        }
+        for (uint16_t x = (uint16_t)(gx + 1u); x < (uint16_t)(gx + gw - 1u); x = (uint16_t)(x + 12u)) {
+            lcd_rect(x, (uint16_t)y, 3, 1, color);
+        }
+        scope_format_signed_mv(level, scope_raw_delta_mv(src, scope_window_high));
+        lcd_text((uint16_t)(gx + gw - 58u),
+                 (uint16_t)(y > (int16_t)(gy + 9u) ? y - 8 : y + 2),
+                 level,
+                 color,
+                 bg,
+                 1);
+    }
+#endif
 }
 
 #if SCOPE_UI_SAFE_STUB
@@ -6393,15 +6465,52 @@ static void draw_scope_trace(uint16_t color,
 #if FPGA_HW_TRIGGER
 static void ui_render_local_change(void);
 static void capture_screenshot_now(void);
+static void cycle_u8(uint8_t *value, uint8_t count, int8_t dir);
 
 // Acquisition / trigger setup (CH2 long press in scope mode), drawn like the math menu.
 enum {
     SCOPE_SETUP_ACQUIRE,
+    SCOPE_SETUP_TYPE,
+    SCOPE_SETUP_PULSE,
+    SCOPE_SETUP_TIME1,
+    SCOPE_SETUP_TIME2,
+    SCOPE_SETUP_WINDOW,
     SCOPE_SETUP_ROWS,
 };
 static uint8_t scope_setup_menu_visible;
 static uint8_t scope_setup_selected;
 static const char *const scope_acquisition_labels[] = {"NORMAL", "PEAK DETECT"};
+static const char *const scope_trigger_type_labels[] = {"EDGE", "PULSE WIDTH", "TIMEOUT", "WINDOW"};
+static const char *const scope_pulse_cond_labels[] = {"SHORTER (<= T1)", "LONGER (> T1)", "T1 < W <= T2"};
+
+// 1-2-5 time in ns as 100NS, 20US, 5MS, 1S
+static void scope_format_trig_time(char out[12], uint32_t ns) {
+    static const char *const units[] = {"NS", "US", "MS", "S"};
+    uint8_t u = 0;
+    uint8_t n;
+
+    while (ns >= 1000u && u < 3u) {
+        ns /= 1000u;
+        ++u;
+    }
+    scope_format_u32(out, ns);
+    n = scope_text_len(out);
+    scope_text_copy(&out[n], units[u], (uint8_t)(12u - n));
+}
+
+static uint8_t scope_setup_row_enabled(uint8_t row) {
+    if (row == SCOPE_SETUP_PULSE || row == SCOPE_SETUP_TIME2) {
+        return scope_trigger_type == SCOPE_HW_TYPE_PULSE &&
+               (row == SCOPE_SETUP_PULSE || scope_pulse_cond == SCOPE_HW_PULSE_RANGE);
+    }
+    if (row == SCOPE_SETUP_TIME1) {
+        return scope_trigger_type == SCOPE_HW_TYPE_PULSE || scope_trigger_type == SCOPE_HW_TYPE_TIMEOUT;
+    }
+    if (row == SCOPE_SETUP_WINDOW) {
+        return scope_trigger_type == SCOPE_HW_TYPE_WINDOW;
+    }
+    return 1;
+}
 
 static void ui_draw_scope_setup_menu(void) {
     uint16_t box_x = 50;
@@ -6411,6 +6520,8 @@ static void ui_draw_scope_setup_menu(void) {
     uint16_t box_h = (uint16_t)(36u + SCOPE_SETUP_ROWS * 18u + 14u);
     uint16_t row_y = (uint16_t)(box_y + 26u);
     const char *note = "";
+    char value_text[12];
+    char note_text[40];
 
     if (!scope_setup_menu_visible) {
         return;
@@ -6421,9 +6532,9 @@ static void ui_draw_scope_setup_menu(void) {
     lcd_rect((uint16_t)(box_x + 10u), (uint16_t)(box_y + 20u), (uint16_t)(box_w - 20u), 1, RGB565(100, 100, 100));
     for (uint8_t row = 0; row < SCOPE_SETUP_ROWS; ++row) {
         uint16_t bg = scope_setup_selected == row ? RGB565(0, 120, 240) : box_bg;
-        uint16_t fg = RGB565(255, 255, 255);
+        uint16_t fg = scope_setup_row_enabled(row) ? RGB565(255, 255, 255) : RGB565(120, 120, 120);
         const char *label = "";
-        const char *value = "";
+        const char *value = value_text;
 
         if (row == SCOPE_SETUP_ACQUIRE) {
             label = "ACQUIRE:";
@@ -6432,22 +6543,62 @@ static void ui_draw_scope_setup_menu(void) {
                 fg = RGB565(120, 120, 120);
                 note = "PEAK: Y-T, 2US/DIV AND SLOWER";
             }
+        } else if (row == SCOPE_SETUP_TYPE) {
+            label = "TRIG TYPE:";
+            value = scope_trigger_type_labels[scope_trigger_type & 3u];
+        } else if (row == SCOPE_SETUP_PULSE) {
+            label = "PULSE:";
+            value = scope_pulse_cond_labels[scope_pulse_cond < 3u ? scope_pulse_cond : 0u];
+        } else if (row == SCOPE_SETUP_TIME1 || row == SCOPE_SETUP_TIME2) {
+            uint8_t t = row == SCOPE_SETUP_TIME2 ? 1u : 0u;
+            label = t ? "TIME 2 (T2):" : "TIME 1 (T1):";
+            scope_format_trig_time(value_text, scope_trig_times_ns[scope_trig_time_idx[t] % SCOPE_TRIG_TIME_COUNT]);
+            if (scope_setup_selected == row && scope_setup_row_enabled(row)) {
+                // what the FPGA counts: samples of the current timebase
+                char number[11];
+                scope_format_u32(number, scope_trig_samples(t));
+                scope_text_copy(note_text, "= ", sizeof(note_text));
+                ui_text_append(note_text, number, sizeof(note_text));
+                ui_text_append(note_text, " SAMPLES AT THIS TIME/DIV", sizeof(note_text));
+                note = note_text;
+            }
+        } else {
+            label = "WIN HIGH:";
+            scope_format_signed_mv(value_text, scope_raw_delta_mv(scope_trigger_source_index(), scope_window_high));
+            if (scope_setup_selected == row && scope_setup_row_enabled(row)) {
+                note = "WINDOW LOW = TRIGGER LEVEL";
+            }
         }
         lcd_rect((uint16_t)(box_x + 8u), row_y, (uint16_t)(box_w - 16u), 14, bg);
         lcd_text((uint16_t)(box_x + 12u), (uint16_t)(row_y + 3u), label, fg, bg, 1);
-        lcd_text((uint16_t)(box_x + 110u), (uint16_t)(row_y + 3u), value, fg, bg, 1);
+        lcd_text((uint16_t)(box_x + 96u), (uint16_t)(row_y + 3u), value, fg, bg, 1);
         row_y = (uint16_t)(row_y + 18u);
     }
     lcd_text((uint16_t)(box_x + 12u), (uint16_t)(row_y + 2u), note, RGB565(160, 160, 160), box_bg, 1);
 }
 
 static void scope_setup_adjust(int8_t dir) {
-    (void)dir;
     if (scope_setup_selected == SCOPE_SETUP_ACQUIRE) {
         scope_acquisition = scope_acquisition ? SCOPE_HW_ACQ_NORMAL : SCOPE_HW_ACQ_PEAK;
-        scope_trigger_locked = 0;
-        scope_trace_invalidate();
+    } else if (scope_setup_selected == SCOPE_SETUP_TYPE) {
+        cycle_u8(&scope_trigger_type, 4u, dir);
+    } else if (!scope_setup_row_enabled(scope_setup_selected)) {
+        return;
+    } else if (scope_setup_selected == SCOPE_SETUP_PULSE) {
+        cycle_u8(&scope_pulse_cond, 3u, dir);
+    } else if (scope_setup_selected == SCOPE_SETUP_TIME1 || scope_setup_selected == SCOPE_SETUP_TIME2) {
+        uint8_t *idx = &scope_trig_time_idx[scope_setup_selected == SCOPE_SETUP_TIME2 ? 1u : 0u];
+        if (dir > 0 && *idx + 1u < SCOPE_TRIG_TIME_COUNT) {
+            ++*idx;
+        } else if (dir < 0 && *idx > 0u) {
+            --*idx;
+        }
+    } else {
+        int16_t next = (int16_t)scope_window_high + dir * 4;
+        scope_window_high = (uint8_t)(next < 12 ? 12 : next > 243 ? 243 : next);
     }
+    scope_trigger_locked = 0;
+    scope_trace_invalidate();
 }
 
 static uint8_t ui_handle_keys_scope_setup_menu(uint32_t events) {

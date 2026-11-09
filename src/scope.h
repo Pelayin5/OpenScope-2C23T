@@ -26,6 +26,19 @@ enum {
     SCOPE_HW_ACQ_PEAK,
 };
 
+enum {
+    SCOPE_HW_TYPE_EDGE,
+    SCOPE_HW_TYPE_PULSE,
+    SCOPE_HW_TYPE_TIMEOUT,
+    SCOPE_HW_TYPE_WINDOW,
+};
+
+enum {
+    SCOPE_HW_PULSE_LE,
+    SCOPE_HW_PULSE_GT,
+    SCOPE_HW_PULSE_RANGE,
+};
+
 // Hardware trigger and acquisition settings (open HW4 bitstream).
 typedef struct {
     uint8_t enabled;
@@ -36,6 +49,13 @@ typedef struct {
     uint16_t pre_samples;
     // Peak detect: pair 2k holds the minimum and pair 2k+1 the maximum of the same group.
     uint8_t acquisition;
+    // Pulse width (end of an active run of width_lo/width_hi samples), timeout (still active
+    // width_lo samples after the edge), window (leaves [level, level_high]).
+    uint8_t type;
+    uint8_t pulse;
+    uint16_t width_lo;
+    uint16_t width_hi;
+    uint8_t level_high;
 } scope_hw_trigger_t;
 
 // At SCOPE_HW_SPAN_MAX the FPGA stores one byte per fast clock, alternating CH1 and CH2, so a

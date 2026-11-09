@@ -726,6 +726,14 @@ void scope_hw_set_trigger(const scope_hw_trigger_t *trigger) {
     if (trigger->acquisition == SCOPE_HW_ACQ_PEAK) {
         ext[0] = FPGA_ACQ_PEAK;
     }
+    if (trigger->enabled && trigger->type <= SCOPE_HW_TYPE_WINDOW && trigger->type != SCOPE_HW_TYPE_EDGE) {
+        ext[1] = (uint8_t)(trigger->type | ((trigger->pulse & 3u) << 2));
+        ext[2] = trigger->level_high;
+        ext[4] = (uint8_t)(trigger->width_lo >> 8);
+        ext[5] = (uint8_t)trigger->width_lo;
+        ext[6] = (uint8_t)(trigger->width_hi >> 8);
+        ext[7] = (uint8_t)trigger->width_hi;
+    }
     if (trigger->enabled) {
         if (mode >= (uint8_t)sizeof(modes)) {
             mode = SCOPE_HW_TRIGGER_AUTO;

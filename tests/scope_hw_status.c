@@ -60,7 +60,8 @@ static void set_counter(uint8_t flags, uint32_t periods, uint32_t clocks) {
 }
 
 static void test_config(void) {
-    scope_hw_trigger_t t = {1, SCOPE_HW_TRIGGER_NORMAL, 0, 0, 140u, 600u, SCOPE_HW_ACQ_NORMAL};
+    scope_hw_trigger_t t = {1, SCOPE_HW_TRIGGER_NORMAL, 0, 0, 140u, 600u, SCOPE_HW_ACQ_NORMAL,
+                            SCOPE_HW_TYPE_EDGE, 0, 0, 0, 0};
 
     scope_hw_set_trigger(&t);
     assert(tail[0] == FPGA_TRIGGER_MAGIC && tail[1] == FPGA_TRIGGER_MODE_NORMAL && !ext[0]);
@@ -78,12 +79,34 @@ static void test_config(void) {
     scope_hw_set_trigger(&t);
     for (unsigned i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) assert(tail[i] == i);
     assert(!ext[0]);
+
+    // Pulse width X < w <= Y: type, condition, window level and widths in the extension.
+    t.enabled = 1;
+    t.type = SCOPE_HW_TYPE_PULSE;
+    t.pulse = SCOPE_HW_PULSE_RANGE;
+    t.width_lo = 0x0123u;
+    t.width_hi = 0x4567u;
+    t.level_high = 200u;
+    scope_hw_set_trigger(&t);
+    assert(tail[1] == (FPGA_TRIGGER_MODE_NORMAL | FPGA_TRIGGER_EXTENDED) && ext[0] == 0 &&
+           ext[1] == (FPGA_TRIGGER_TYPE_PULSE | (FPGA_PULSE_RANGE << 2)) && ext[2] == 200u &&
+           ext[4] == 0x01u && ext[5] == 0x23u && ext[6] == 0x45u && ext[7] == 0x67u);
+    t.type = SCOPE_HW_TYPE_WINDOW;
+    scope_hw_set_trigger(&t);
+    assert(ext[1] == (FPGA_TRIGGER_TYPE_WINDOW | (FPGA_PULSE_RANGE << 2)));
+    // A type without the hardware trigger means nothing: stock bytes again.
+    t.enabled = 0;
+    scope_hw_set_trigger(&t);
+    for (unsigned i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) assert(tail[i] == i);
+    for (unsigned i = 0; i < FPGA_TRIGGER_EXT_BYTES; ++i) assert(!ext[i]);
+    t.type = SCOPE_HW_TYPE_EDGE;
 }
 
 static void test_status(void) {
     uint64_t mhz = 0;
     uint16_t pre = 0;
-    scope_hw_trigger_t t = {1, SCOPE_HW_TRIGGER_NORMAL, 0, 0, 140u, 600u, SCOPE_HW_ACQ_PEAK};
+    scope_hw_trigger_t t = {1, SCOPE_HW_TRIGGER_NORMAL, 0, 0, 140u, 600u, SCOPE_HW_ACQ_PEAK,
+                            SCOPE_HW_TYPE_EDGE, 0, 0, 0, 0};
 
     scope_hw_set_trigger(&t);
     status[0] = FPGA_TRIGGER_STATUS_ID;

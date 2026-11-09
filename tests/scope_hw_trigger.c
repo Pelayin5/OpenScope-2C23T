@@ -17,6 +17,7 @@ static uint16_t hw_hit_pre;
 
 static uint8_t hw_acquisition;
 static uint8_t hw_capture_acq;
+static scope_hw_trigger_t hw_trigger;
 
 void scope_hw_set_trigger(const scope_hw_trigger_t *trigger) {
     hw_enabled = trigger->enabled;
@@ -26,6 +27,7 @@ void scope_hw_set_trigger(const scope_hw_trigger_t *trigger) {
     hw_level = trigger->level;
     hw_pre = trigger->pre_samples;
     hw_acquisition = trigger->acquisition;
+    hw_trigger = *trigger;
 }
 
 uint8_t scope_hw_capture_acquisition(void) {
@@ -252,12 +254,61 @@ static void test_counter_readout(void) {
     assert(strcmp(out, "41.67KHZ") != 0);
 }
 
+// Trigger types: menu times converted to samples of the current timebase.
+static void test_trigger_types(void) {
+    char out[12];
+
+    setup();
+    scope_hw_trigger_sync();
+    assert(hw_trigger.type == SCOPE_HW_TYPE_EDGE);
+    scope_trigger_type = SCOPE_HW_TYPE_PULSE;
+    scope_pulse_cond = SCOPE_HW_PULSE_RANGE;
+    scope_trig_time_idx[0] = SCOPE_TRIG_TIME_DEFAULT_1;      // 1 ms
+    scope_trig_time_idx[1] = SCOPE_TRIG_TIME_DEFAULT_2;      // 10 ms
+    scope_window_high = 200u;
+    ui.scope_timebase = 15u;                                  // 5MS: ~200 us per sample pair
+    uint32_t period = scope_sample_period_ns();
+    assert(period > 190000u && period < 210000u);
+    scope_hw_trigger_sync();
+    assert(hw_trigger.type == SCOPE_HW_TYPE_PULSE && hw_trigger.pulse == SCOPE_HW_PULSE_RANGE &&
+           hw_trigger.width_lo == (1000000u + period / 2u) / period &&
+           hw_trigger.width_hi == (10000000u + period / 2u) / period && hw_trigger.level_high == 200u);
+    // rounded to the nearest sample, at least one, at most 65535
+    scope_trig_time_idx[0] = 0;                               // 100 ns
+    assert(scope_trig_samples(0) == 1u);
+    ui.scope_timebase = 4u;                                   // 1US: 40 ns per pair
+    scope_trig_time_idx[0] = SCOPE_TRIG_TIME_COUNT - 1u;      // 2 s
+    assert(scope_trig_samples(0) == 0xFFFFu);
+    ui.scope_timebase = 11u;                                  // 200US: ~8 us per pair
+    scope_trig_time_idx[0] = 7u;                              // 20 us = ~2.5 samples
+    period = scope_sample_period_ns();
+    assert(scope_trig_samples(0) == (20000u + period / 2u) / period);
+    scope_format_trig_time(out, 100u);
+    assert(strcmp(out, "100NS") == 0);
+    scope_format_trig_time(out, 20000u);
+    assert(strcmp(out, "20US") == 0);
+    scope_format_trig_time(out, 500000000u);
+    assert(strcmp(out, "500MS") == 0);
+    scope_format_trig_time(out, 2000000000u);
+    assert(strcmp(out, "2S") == 0);
+    // menu rows: only the ones that apply can be changed
+    scope_setup_selected = SCOPE_SETUP_WINDOW;
+    scope_setup_adjust(1);
+    assert(scope_window_high == 200u);
+    scope_trigger_type = SCOPE_HW_TYPE_WINDOW;
+    scope_setup_adjust(1);
+    assert(scope_window_high == 204u);
+    scope_trigger_type = SCOPE_HW_TYPE_EDGE;
+    scope_trig_time_idx[0] = SCOPE_TRIG_TIME_DEFAULT_1;
+}
+
 int main(void) {
     test_settings();
     test_window();
     test_peak();
     test_peak_measurements();
     test_counter_readout();
-    puts("scope hardware trigger mapping, peak detect and counter readout tests passed");
+    test_trigger_types();
+    puts("scope hardware trigger mapping, peak detect, counter readout and trigger type tests passed");
     return 0;
 }

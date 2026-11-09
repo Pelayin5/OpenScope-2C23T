@@ -47,6 +47,15 @@ enum {
     FPGA_TRIGGER_EXT_BYTES = 8,
     FPGA_ACQ_NORMAL = 0,
     FPGA_ACQ_PEAK = 1,
+    // Extension byte 1: trigger type [1:0] and pulse condition [3:2]; byte 2: window high
+    // level; bytes 4..7: X, Y in source samples (MSB first).
+    FPGA_TRIGGER_TYPE_EDGE = 0,
+    FPGA_TRIGGER_TYPE_PULSE = 1,
+    FPGA_TRIGGER_TYPE_TIMEOUT = 2,
+    FPGA_TRIGGER_TYPE_WINDOW = 3,
+    FPGA_PULSE_LE = 0,     // width <= X
+    FPGA_PULSE_GT = 1,     // width > X
+    FPGA_PULSE_RANGE = 2,  // X < width <= Y
 
     // Extended status: read-back bytes 24..39.
     FPGA_EXT_STATUS_BYTES = 16,
@@ -55,6 +64,7 @@ enum {
     FPGA_EXT_STATUS_FEATURES = 9,
     FPGA_EXT_STATUS_ACQ = 10,
     FPGA_FEATURE_PEAK = 1u << 0,
+    FPGA_FEATURE_TRIGGER_TYPES = 1u << 1,
     FPGA_FEATURE_COUNTER = 1u << 2,
     // Frequency counter flags: E periods took T fast clocks (reciprocal, gate ~100 ms).
     FPGA_COUNTER_VALID = 1u << 0,

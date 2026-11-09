@@ -14,6 +14,9 @@ SCOPE_HW_CAPTURE ?= 1
 SCOPE_UI_SAFE_STUB ?= 0
 SCOPE_ANALOG_CONFIG ?= 1
 SCOPE_ATTENUATOR_CONFIG ?= 1
+# This branch embeds the open HW4 bitstream (50 MHz, hardware trigger) in src/fpga_bitstream_hw4.c.
+FPGA_OPEN_BITSTREAM ?= $(HW_TARGET_HW40)
+FPGA_HW_TRIGGER ?= $(FPGA_OPEN_BITSTREAM)
 
 CLANG ?= clang
 RUST_LLD := $(shell find $(HOME)/.rustup/toolchains -path '*/bin/rust-lld' | head -1)
@@ -45,7 +48,9 @@ CFLAGS := \
 	-DSCOPE_HW_CAPTURE=$(SCOPE_HW_CAPTURE) \
 	-DSCOPE_UI_SAFE_STUB=$(SCOPE_UI_SAFE_STUB) \
 	-DSCOPE_ANALOG_CONFIG=$(SCOPE_ANALOG_CONFIG) \
-	-DSCOPE_ATTENUATOR_CONFIG=$(SCOPE_ATTENUATOR_CONFIG)
+	-DSCOPE_ATTENUATOR_CONFIG=$(SCOPE_ATTENUATOR_CONFIG) \
+	-DFPGA_OPEN_BITSTREAM=$(FPGA_OPEN_BITSTREAM) \
+	-DFPGA_HW_TRIGGER=$(FPGA_HW_TRIGGER)
 
 LDFLAGS := \
 	-target armv7em-none-eabi \
@@ -79,9 +84,12 @@ HOST_TEST_BINS := $(BUILD_ROOT)/tests/bootloader-old $(BUILD_ROOT)/tests/bootloa
                   $(BUILD_ROOT)/tests/dmm-old $(BUILD_ROOT)/tests/dmm-hw4 \
                   $(BUILD_ROOT)/tests/scope_window-old $(BUILD_ROOT)/tests/scope_window-hw4 \
                   $(BUILD_ROOT)/tests/scope_measurements-old $(BUILD_ROOT)/tests/scope_measurements-hw4 \
+                  $(BUILD_ROOT)/tests/scope_measurements-open \
                   $(BUILD_ROOT)/tests/fft $(BUILD_ROOT)/tests/settings \
                   $(BUILD_ROOT)/tests/generator-old $(BUILD_ROOT)/tests/generator-hw4 \
-                  $(BUILD_ROOT)/tests/fpga_timing-old $(BUILD_ROOT)/tests/fpga_timing-hw4
+                  $(BUILD_ROOT)/tests/fpga_timing-old $(BUILD_ROOT)/tests/fpga_timing-hw4 \
+                  $(BUILD_ROOT)/tests/fpga_timing-open $(BUILD_ROOT)/tests/generator-open \
+                  $(BUILD_ROOT)/tests/scope_hw_trigger-hw4
 
 .PHONY: all clean clean-dist release release-lt-hw4 release-hw4 test
 
@@ -98,12 +106,16 @@ test: $(HOST_TEST_BINS)
 	$(BUILD_ROOT)/tests/scope_window-hw4
 	$(BUILD_ROOT)/tests/scope_measurements-old
 	$(BUILD_ROOT)/tests/scope_measurements-hw4
+	$(BUILD_ROOT)/tests/scope_measurements-open
 	$(BUILD_ROOT)/tests/fft
 	$(BUILD_ROOT)/tests/settings
 	$(BUILD_ROOT)/tests/generator-old
 	$(BUILD_ROOT)/tests/generator-hw4
 	$(BUILD_ROOT)/tests/fpga_timing-old
 	$(BUILD_ROOT)/tests/fpga_timing-hw4
+	$(BUILD_ROOT)/tests/fpga_timing-open
+	$(BUILD_ROOT)/tests/generator-open
+	$(BUILD_ROOT)/tests/scope_hw_trigger-hw4
 
 $(BUILD_ROOT)/tests/bootloader-old $(BUILD_ROOT)/tests/bootloader-hw4: tests/bootloader.c src/bootloader.c src/bootloader.h src/app_config.h
 	@mkdir -p $(dir $@)
@@ -120,6 +132,22 @@ $(BUILD_ROOT)/tests/generator-old $(BUILD_ROOT)/tests/generator-hw4: tests/gener
 $(BUILD_ROOT)/tests/fpga_timing-old $(BUILD_ROOT)/tests/fpga_timing-hw4: tests/fpga_timing.c src/fpga.c src/fpga.h src/hw.h
 	@mkdir -p $(dir $@)
 	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=$(if $(filter %-hw4,$@),1,0) $< $(HOST_TEST_LINK) -o $@
+
+$(BUILD_ROOT)/tests/scope_hw_trigger-hw4: tests/scope_hw_trigger.c src/ui.c src/scope.h src/fpga.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 -DFPGA_HW_TRIGGER=1 $< $(HOST_TEST_LINK) -o $@
+
+$(BUILD_ROOT)/tests/scope_measurements-open: tests/scope_measurements.c src/ui.c src/scope.h src/fpga.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 $< $(HOST_TEST_LINK) -o $@
+
+$(BUILD_ROOT)/tests/fpga_timing-open: tests/fpga_timing.c src/fpga.c src/fpga.h src/hw.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 $< $(HOST_TEST_LINK) -o $@
+
+$(BUILD_ROOT)/tests/generator-open: tests/generator.c src/ui.c src/siggen.c src/siggen.h src/fft.c src/settings.h src/fpga.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 $< src/siggen.c src/fft.c $(HOST_TEST_LINK) -o $@
 
 $(BUILD_ROOT)/tests/dmm-old $(BUILD_ROOT)/tests/dmm-hw4: tests/dmm.c src/dmm.c src/dmm.h src/ui.c src/settings.h src/hw.h Makefile
 	@mkdir -p $(dir $@)

@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 enum {
-    FPGA_DDS_CLOCK_HZ = 100000000u,
+    FPGA_DDS_CLOCK_HZ = FPGA_FAST_CLOCK_HZ,
     FPGA_FULL_SCALE_MV = 3300,
     SIGGEN_TIMING_SETTLE_MS = 2,
     SIGGEN_BUFFER_SETTLE_MS = 2,
@@ -224,6 +224,11 @@ static uint32_t tuning_word_for(uint32_t freq_hz) {
     if (freq_hz > 2000000u) {
         freq_hz = 2000000u;
     }
+    if (FPGA_DDS_CLOCK_HZ == 50000000u) {
+        // 2^32 / 50 MHz = 85.90
+        return freq_hz * 86u - freq_hz / 10u;
+    }
+    // 2^32 / 100 MHz = 42.95
     return freq_hz * 43u - freq_hz / 20u;
 }
 

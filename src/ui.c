@@ -341,6 +341,16 @@ static uint8_t scope_slow_roll_timebase = 0xFFu;
 static uint16_t scope_slow_roll_seq = 0xFFFFu;
 static uint16_t scope_trigger_offset;
 static uint8_t scope_trigger_locked;
+#if FPGA_OPEN_BITSTREAM && HW_TARGET_HW40
+// Open bitstream diagnostic box (SAVE in scope mode): bus self-test and live capture status.
+enum {
+    SCOPE_FPGA_DIAG_REFRESH_MS = 250,
+};
+static uint8_t scope_fpga_diag_active;
+static uint16_t scope_fpga_diag_ms;
+static uint8_t scope_fpga_diag_live[FPGA_TRIGGER_STATUS_BYTES];
+static uint8_t scope_fpga_diag_live_ok;
+#endif
 static uint8_t scope_roll_trigger_pending;
 static uint16_t scope_roll_trigger_seq;
 static uint16_t scope_roll_trigger_target_seq;
@@ -4626,6 +4636,49 @@ static uint8_t scope_trigger_accepts_capture(uint8_t found) {
     return found;
 }
 
+// Hardware trigger (open HW4 bitstream): the trigger sample lands at the window position the
+// software trigger would use, so the same capture window logic applies.
+static void scope_hw_trigger_sync(void) {
+#if FPGA_HW_TRIGGER
+    uint8_t src = scope_trigger_source_index();
+    uint8_t mode = SCOPE_HW_TRIGGER_AUTO;
+    uint16_t pre = (uint16_t)(scope_trigger_screen_sample_pos() +
+                              (SCOPE_SAMPLE_COUNT - scope_visible_sample_count()) / 2u);
+
+    if (ui.scope_trigger_mode == SCOPE_TRIGGER_NORMAL) {
+        mode = SCOPE_HW_TRIGGER_NORMAL;
+    } else if (ui.scope_trigger_mode == SCOPE_TRIGGER_SINGLE) {
+        mode = SCOPE_HW_TRIGGER_SINGLE;
+    }
+    scope_hw_set_trigger(!scope_auto_zero_active &&
+                             !scope_slow_roll_active() &&
+                             ui.scope_display == SCOPE_DISPLAY_YT &&
+                             scope_ch_enabled[src],
+                         mode,
+                         src,
+                         ui.scope_trigger_edge,
+                         ui.scope_trigger_level,
+                         pre);
+#endif
+}
+
+static uint8_t scope_hw_trigger_offset(uint16_t *offset) {
+#if FPGA_HW_TRIGGER
+    uint16_t pre;
+    uint16_t pos = scope_trigger_screen_sample_pos();
+    uint16_t max_start = (uint16_t)(SCOPE_SAMPLE_COUNT - scope_visible_sample_count());
+
+    if (!offset || !scope_hw_trigger_position(&pre) || pre < pos || pre - pos > max_start) {
+        return 0;
+    }
+    *offset = (uint16_t)(pre - pos);
+    return 1;
+#else
+    (void)offset;
+    return 0;
+#endif
+}
+
 static uint8_t scope_poll_frame(void) {
     if (!scope_hw_enabled()) {
         scope_frame_valid = 0;
@@ -4641,6 +4694,7 @@ static uint8_t scope_poll_frame(void) {
     uint8_t trigger_found;
     uint8_t slow_roll = scope_slow_roll_active();
 
+    scope_hw_trigger_sync();
     if (slow_roll) {
         uint16_t hw_count = 0;
         uint16_t hw_seq = 0;
@@ -4748,7 +4802,10 @@ static uint8_t scope_poll_frame(void) {
     if (!scope_auto_zero_active &&
         ui.scope_display == SCOPE_DISPLAY_YT &&
         scope_ch_enabled[scope_trigger_source_index()]) {
-        trigger_found = scope_find_trigger_offset(scope_capture_samples, &trigger_offset);
+        trigger_found = scope_hw_trigger_offset(&trigger_offset);
+        if (!trigger_found) {
+            trigger_found = scope_find_trigger_offset(scope_capture_samples, &trigger_offset);
+        }
     } else {
         trigger_found = 0;
     }
@@ -4805,6 +4862,7 @@ static void scope_apply_settings_keep_frame(uint8_t keep_frame) {
         scope_trace_invalidate();
     }
     scope_sanitize_state();
+    scope_hw_trigger_sync();
     scope_hw_slow_stop();
     scope_hw_configure_channels(ui.scope_timebase,
                                 scope_vdiv_ch[0],
@@ -7395,6 +7453,168 @@ static void ui_draw_gen_preview_params_scene(void) {
     draw_gen_param_row(GEN_PARAM_ROW_X, (uint16_t)(Y_SOFT + 4u));
 }
 
+#if FPGA_OPEN_BITSTREAM && HW_TARGET_HW40
+static char *scope_diag_put(char *p, const char *text) {
+    while (*text) {
+        *p++ = *text++;
+    }
+    *p = 0;
+    return p;
+}
+
+static char *scope_diag_put_u32(char *p, uint32_t value) {
+    char digits[11];
+
+    scope_format_u32(digits, value);
+    return scope_diag_put(p, digits);
+}
+
+static char *scope_diag_put_hex(char *p, uint32_t value, uint8_t digits) {
+    static const char hex[] = "0123456789ABCDEF";
+
+    while (digits--) {
+        *p++ = hex[(value >> (4u * digits)) & 0x0Fu];
+    }
+    *p = 0;
+    return p;
+}
+
+static char *scope_diag_put_bytes(char *p, const uint8_t *bytes, uint8_t count) {
+    for (uint8_t i = 0; i < count; ++i) {
+        *p++ = ' ';
+        p = scope_diag_put_hex(p, bytes[i], 2);
+    }
+    return p;
+}
+
+// status bytes 16..23: id, flags, rot, trigger entry, version, control
+static char *scope_diag_put_status(char *p, const uint8_t *st) {
+    static const char flag_names[6][5] = {"RDY", "TRG", "FRC", "EN", "WAIT", "HOLD"};
+
+    p = scope_diag_put(p, " F:");
+    p = scope_diag_put_hex(p, st[1], 2);
+    for (uint8_t i = 0; i < 6u; ++i) {
+        if (st[1] & (1u << i)) {
+            p = scope_diag_put(p, " ");
+            p = scope_diag_put(p, flag_names[i]);
+        }
+    }
+    p = scope_diag_put(p, " ROT:");
+    p = scope_diag_put_hex(p, ((uint32_t)(st[2] & 0x0Fu) << 8) | st[3], 3);
+    p = scope_diag_put(p, " ENT:");
+    return scope_diag_put_hex(p, ((uint32_t)(st[4] & 0x0Fu) << 8) | st[5], 3);
+}
+
+static void draw_scope_fpga_diag_box(uint16_t x, uint16_t y) {
+    static const char *const scope_status_names[] = {"IDLE", "NOFPGA", "WAIT", "READERR", "FRAME"};
+    const uint16_t box_bg = RGB565(0, 0, 0);
+    const uint16_t w = 300;
+    const uint16_t h = 104;
+    const uint16_t tx = (uint16_t)(x + 3u);
+    const fpga_bus_test_t *bt = fpga_bus_test_result();
+    uint16_t ly = (uint16_t)(y + 2u);
+    uint32_t span = scope_hw_span_for_unit_ns(scope_timebase_unit_ns_value());
+    uint8_t last[FPGA_TRIGGER_STATUS_BYTES];
+    uint16_t pre;
+    uint8_t st = scope_hw_last_status();
+    char line[54];
+    char *p;
+
+    lcd_rect(x, y, w, h, box_bg);
+    lcd_frame(x, y, w, h, C_WARN);
+
+    p = scope_diag_put(line, "OPEN FPGA 50MHZ ");
+    p = scope_diag_put(p, FPGA_HW_TRIGGER ? "HW TRIGGER" : "CLONE (SW TRIGGER)");
+    lcd_text(tx, ly, line, C_TEXT, box_bg, 1);
+    ly = (uint16_t)(ly + 10u);
+
+    // 2-4: bus self-test at load (D0..D7 = PC0..PC7, D7 on pin 13)
+    if (!bt->done) {
+        p = scope_diag_put(line, "BUS TEST: NOT RUN");
+    } else if (!bt->bad_bits) {
+        p = scope_diag_put(line, "BUS TEST: OK D0-D7 (D7 PIN 13 OK)");
+    } else {
+        p = scope_diag_put(line, "BUS TEST: BAD BITS:");
+        p = scope_diag_put_hex(p, bt->bad_bits, 2);
+        for (uint8_t i = 0; i < 8u; ++i) {
+            if (bt->bad_bits & (1u << i)) {
+                p = scope_diag_put(p, " D");
+                p = scope_diag_put_u32(p, i);
+            }
+        }
+    }
+    lcd_text(tx, ly, line, bt->done && !bt->bad_bits ? C_CH2 : C_WARN, box_bg, 1);
+    ly = (uint16_t)(ly + 10u);
+    p = scope_diag_put(line, "SENT:");
+    p = scope_diag_put_bytes(p, &bt->sent[8], 8);
+    lcd_text(tx, ly, line, C_MUTED, box_bg, 1);
+    ly = (uint16_t)(ly + 10u);
+    p = scope_diag_put(line, "READ:");
+    p = scope_diag_put_bytes(p, &bt->read[8], 8);
+    lcd_text(tx, ly, line, bt->bad_bits ? C_WARN : C_MUTED, box_bg, 1);
+    ly = (uint16_t)(ly + 10u);
+
+    // 5-6: live status (register read-back every 250 ms)
+    p = scope_diag_put(line, "LIVE");
+    if (scope_fpga_diag_live_ok) {
+        p = scope_diag_put_status(p, scope_fpga_diag_live);
+    } else {
+        p = scope_diag_put(p, " ID:");
+        p = scope_diag_put_hex(p, scope_fpga_diag_live[0], 2);
+        p = scope_diag_put(p, " V:");
+        p = scope_diag_put_hex(p, scope_fpga_diag_live[6], 2);
+        p = scope_diag_put(p, " (NO STATUS)");
+    }
+    lcd_text(tx, ly, line, scope_fpga_diag_live_ok ? C_CH1 : C_WARN, box_bg, 1);
+    ly = (uint16_t)(ly + 10u);
+    p = scope_diag_put(line, "CTL:");
+    p = scope_diag_put_hex(p, scope_fpga_diag_live[7], 2);
+    p = scope_diag_put(p, " SPAN:");
+    p = scope_diag_put_hex(p, span, 6);
+    p = scope_diag_put(p, " PAIR:");
+    p = scope_diag_put_u32(p, scope_sample_period_ns());
+    p = scope_diag_put(p, "NS");
+    lcd_text(tx, ly, line, C_MUTED, box_bg, 1);
+    ly = (uint16_t)(ly + 10u);
+
+    // 7: status of the last capture read and the trigger pair the firmware used
+    p = scope_diag_put(line, "LAST");
+    if (scope_hw_trigger_status(last)) {
+        p = scope_diag_put_status(p, last);
+        if (scope_hw_trigger_position(&pre)) {
+            p = scope_diag_put(p, " PRE:");
+            p = scope_diag_put_u32(p, pre);
+        }
+    } else {
+        p = scope_diag_put(p, " -");
+    }
+    lcd_text(tx, ly, line, C_TEXT, box_bg, 1);
+    ly = (uint16_t)(ly + 10u);
+
+    // 8: capture counters
+    p = scope_diag_put(line, "FRM:");
+    p = scope_diag_put_u32(p, scope_hw_frame_count());
+    p = scope_diag_put(p, " WAIT:");
+    p = scope_diag_put_u32(p, scope_hw_wait_count());
+    p = scope_diag_put(p, " ERR:");
+    p = scope_diag_put_u32(p, scope_hw_error_count());
+    p = scope_diag_put(p, " ");
+    p = scope_diag_put(p, st < sizeof(scope_status_names) / sizeof(scope_status_names[0]) ?
+                              scope_status_names[st] : "?");
+    lcd_text(tx, ly, line, C_TEXT, box_bg, 1);
+    ly = (uint16_t)(ly + 10u);
+
+    lcd_text(tx, ly, "SAVE: CLOSE   SAVE LONG: SCREENSHOT", C_MUTED, box_bg, 1);
+}
+
+static void draw_scope_fpga_diag_overlay(void) {
+    if (!scope_fpga_diag_active || ui.mode != UI_MODE_SCOPE || ui.overlay != UI_OVERLAY_NONE) {
+        return;
+    }
+    draw_scope_fpga_diag_box(10, ui.chrome_visible ? 56u : 29u);
+}
+#endif
+
 static void ui_render_dispatch(void *ctx) {
     (void)ctx;
     if (ui.overlay == UI_OVERLAY_MODE_MENU) {
@@ -7428,6 +7648,9 @@ static void ui_render_dispatch(void *ctx) {
         ui_draw_full_scene();
     }
     draw_scope_calibration_overlay();
+#if FPGA_OPEN_BITSTREAM && HW_TARGET_HW40
+    draw_scope_fpga_diag_overlay();
+#endif
     if (!ui.chrome_visible && (ui.softkeys_ms || scope_any_menu_open())) {
         draw_softkeys();
     }
@@ -10168,6 +10391,24 @@ static uint8_t ui_handle_keys_math_menu(uint32_t events) {
     return 1;
 }
 
+#if FPGA_OPEN_BITSTREAM && HW_TARGET_HW40
+static uint8_t scope_fpga_diag_handle_keys(uint32_t events) {
+    if (ui.mode != UI_MODE_SCOPE || scope_any_menu_open() || ui_math_menu_visible) {
+        return 0;
+    }
+    if (events & KEY_SAVE) {
+        scope_fpga_diag_active = (uint8_t)!scope_fpga_diag_active;
+        scope_fpga_diag_ms = 0;
+        if (scope_fpga_diag_active) {
+            scope_fpga_diag_live_ok = fpga_read_trigger_status(scope_fpga_diag_live);
+        }
+        ui_render_local_change();
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 void ui_handle_keys(uint32_t events) {
     ui.idle_ms = 0;
     ui.sleep_ms = 0;
@@ -10276,6 +10517,12 @@ void ui_handle_keys(uint32_t events) {
     if (scope_auto_zero_active && ui.mode == UI_MODE_SCOPE) {
         return;
     }
+
+#if FPGA_OPEN_BITSTREAM && HW_TARGET_HW40
+    if (scope_fpga_diag_handle_keys(events)) {
+        return;
+    }
+#endif
 
     if (ui.mode == UI_MODE_SCOPE && scope_any_menu_open()) {
         scope_transient_menu_touch();
@@ -10892,6 +11139,23 @@ void ui_tick(uint32_t elapsed_ms) {
         ui.scope_ms = 0;
         scope_frame_age_ms = 0;
     }
+#if FPGA_OPEN_BITSTREAM && HW_TARGET_HW40
+    if (scope_fpga_diag_active && ui.mode == UI_MODE_SCOPE) {
+        uint32_t diag_next = (uint32_t)scope_fpga_diag_ms + elapsed_ms;
+
+        if (diag_next >= SCOPE_FPGA_DIAG_REFRESH_MS) {
+            // Live status: also refreshes while a NORM/SINGLE capture waits for its trigger.
+            scope_fpga_diag_ms = 0;
+            scope_fpga_diag_live_ok = fpga_read_trigger_status(scope_fpga_diag_live);
+            if (!rendered) {
+                ui_render_scope_frame();
+                rendered = 1;
+            }
+        } else {
+            scope_fpga_diag_ms = (uint16_t)diag_next;
+        }
+    }
+#endif
 
         if (ui.mode == UI_MODE_SCOPE) {
         scope_stream_telemetry(elapsed_ms);

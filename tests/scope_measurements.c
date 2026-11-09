@@ -87,11 +87,11 @@ static void test_hardware_timing(void) {
         assert(scope_slow_roll_active() == (tb >= (HW_TARGET_HW40 ? 21 : 18)));
         assert(scope_soft_roll_active() == (!HW_TARGET_HW40 && tb == 18));
         assert(scope_irq_roll_active() == (tb >= (HW_TARGET_HW40 ? 21 : 19)));
-        uint32_t span = 52428800u / scope_timebase_unit_ns[tb];
+        uint32_t span = (0x100000u * 5u / 2u * SCOPE_HW_PAIR_NS) / scope_timebase_unit_ns[tb];
         if (span > 0x100000u) span = 0x100000u;
         uint32_t expected = scope_slow_roll_active() ?
             (scope_timebase_unit_ns[tb] * 2u + 2u) / 5u :
-            (20u * 0x100000u + span / 2u) / span;
+            (SCOPE_HW_PAIR_NS * 0x100000u + span / 2u) / span;
         assert(scope_sample_period_ns() == expected);
         uint64_t screen_ns = (uint64_t)scope_timebase_unit_ns[tb] * 120u;
         uint64_t visible = (screen_ns + expected / 2u) / expected;
@@ -100,6 +100,25 @@ static void test_hardware_timing(void) {
         assert(scope_visible_sample_count() == visible);
         if (scope_slow_roll_active()) assert(scope_visible_sample_count() == 300u);
     }
+#if FPGA_OPEN_BITSTREAM
+    // Open HW4 bitstream at 50 MHz: 40 ns pairs up to 100NS, stock sample periods from 200NS.
+    assert(SCOPE_HW_PAIR_NS == 40u);
+    ui.scope_timebase = 0;
+    assert(scope_sample_period_ns() == 40u);
+    assert(scope_visible_sample_count() == 15u);
+    ui.scope_timebase = 3;
+    assert(scope_sample_period_ns() == 40u);
+    ui.scope_timebase = 4;
+    assert(scope_sample_period_ns() == 40u);
+    assert(scope_visible_sample_count() == 300u);
+    ui.scope_timebase = 5;
+    assert(scope_sample_period_ns() == 80u);
+    ui.scope_timebase = 17;
+    assert(scope_sample_period_ns() == 806597u);
+    // Finer span truncation than stock at 200MS (5 instead of 2).
+    ui.scope_timebase = 20;
+    assert(scope_sample_period_ns() == 8388608u);
+#else
     ui.scope_timebase = 0;
     assert(scope_sample_period_ns() == 20u);
     assert(scope_visible_sample_count() == 30u);
@@ -123,15 +142,17 @@ static void test_hardware_timing(void) {
     assert(scope_sample_period_ns() == 10485760u);
     assert(scope_visible_sample_count() == 229u);
 #endif
+#endif
 }
 
 static void test_frequency(void) {
     setup();
     ui.scope_timebase = 3;
     fill_square(2, 1, 96, 160);
-    assert(scope_estimate_freq_hz_window(0, 0, SCOPE_SAMPLE_COUNT, 96, 160) == 25000000u);
+    assert(scope_estimate_freq_hz_window(0, 0, SCOPE_SAMPLE_COUNT, 96, 160) ==
+           1000000000u / (2u * SCOPE_HW_PAIR_NS));
     fill_square(5, 2, 96, 160);
-    assert(scope_estimate_freq_hz_window(0, 2, 2046, 96, 160) == 10000000u);
+    assert(scope_estimate_freq_hz_window(0, 2, 2046, 96, 160) == 1000000000u / (5u * SCOPE_HW_PAIR_NS));
     assert(scope_estimate_freq_hz_window(0, 0, 2, 96, 160) == 0);
     for (uint8_t tb = 4; tb < SCOPE_TIMEBASE_COUNT; ++tb) {
         ui.scope_timebase = tb;
@@ -141,7 +162,7 @@ static void test_frequency(void) {
     }
     ui.scope_timebase = 19;
     assert(scope_estimate_freq_hz_window(0, 2, 2046, 96, 160) == (HW_TARGET_HW40 ? 9u : 10u));
-#if HW_TARGET_HW40
+#if HW_TARGET_HW40 && !FPGA_OPEN_BITSTREAM
     // A 1 Hz square wave at 200MS spans five divisions of real time.
     ui.scope_timebase = 20;
     fill_square(95, 48, 96, 160);

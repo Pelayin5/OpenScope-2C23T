@@ -54,6 +54,8 @@ enum {
 };
 
 static volatile uint8_t fpga_hw4_capture_ready_seen;
+static uint8_t fpga_hw4_trigger_tail[FPGA_TRIGGER_TAIL_BYTES] = {0, 1, 2, 3, 4, 5, 6, 7};
+static fpga_bus_test_t fpga_hw4_bus_test;
 
 static void fpga_hw4_short_delay(void) {
     for (volatile uint32_t i = 0; i < 80u; ++i) {
@@ -180,8 +182,8 @@ static void fpga_hw4_write_timing_frame(uint32_t tuning_word, uint32_t span) {
     fpga_hw4_parallel_write_byte((uint8_t)(span >> 8));
     fpga_hw4_parallel_write_byte((uint8_t)span);
 
-    for (uint8_t i = 0; i < 8u; ++i) {
-        fpga_hw4_parallel_write_byte(i);
+    for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) {
+        fpga_hw4_parallel_write_byte(fpga_hw4_trigger_tail[i]);
     }
 
     fpga_hw4_bus_input();
@@ -242,6 +244,9 @@ void fpga_init_once(void) {
     fpga_hw4_capture_ready_seen = 0;
     fpga_ready_flag = status != 0xFFFFFFFFu ? 1u : 0u;
     fpga_loaded = 1u;
+#if FPGA_OPEN_BITSTREAM
+    fpga_bus_test_run();
+#endif
 }
 
 uint8_t fpga_ready(void) {
@@ -312,6 +317,81 @@ uint8_t fpga_capture_read_slow_point(uint8_t sample[2]) {
     sample[1] = fpga_hw4_parallel_read_byte();
     fpga_capture_latch();
     return 1u;
+}
+
+// Takes effect with the next timing frame. NULL restores the stock bytes.
+void fpga_set_trigger_tail(const uint8_t *tail) {
+    for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) {
+        fpga_hw4_trigger_tail[i] = tail ? tail[i] : i;
+    }
+}
+
+// Every data line at 0 and 1; byte 0 is not the trigger magic, so the capture stays free-running.
+static const uint8_t fpga_hw4_bus_test_tail[FPGA_TRIGGER_TAIL_BYTES] = {
+    0x80u, 0x7Fu, 0xAAu, 0x55u, 0xFFu, 0x00u, 0xC3u, 0x3Cu,
+};
+
+// Writes a timing frame with the test tail and reads the 16 frame bytes back. A bad bit is a
+// data line that did not make the round trip MCU -> FPGA -> MCU (D7/PC7 is pin 13).
+void fpga_bus_test_run(void) {
+    fpga_bus_test_t *t = &fpga_hw4_bus_test;
+    uint8_t saved[FPGA_TRIGGER_TAIL_BYTES];
+
+    if (!fpga_loaded) {
+        return;
+    }
+    for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) {
+        saved[i] = fpga_hw4_trigger_tail[i];
+        fpga_hw4_trigger_tail[i] = fpga_hw4_bus_test_tail[i];
+        t->sent[8u + i] = fpga_hw4_bus_test_tail[i];
+    }
+    for (uint8_t i = 0; i < 4u; ++i) {
+        t->sent[i] = (uint8_t)(fpga_last_tuning_word >> (24u - 8u * i));
+        t->sent[4u + i] = (uint8_t)(fpga_last_span >> (24u - 8u * i));
+    }
+    fpga_hw4_write_timing_frame(fpga_last_tuning_word, fpga_last_span);
+
+    gpio_clear(GPIOB_BASE, FPGA_HW4_MOSI_PIN);
+    gpio_set(GPIOA_BASE, FPGA_HW4_SELECT_PIN);
+    fpga_hw4_bus_input();
+    t->bad_bits = 0;
+    for (uint8_t i = 0; i < FPGA_BUS_TEST_BYTES; ++i) {
+        t->read[i] = fpga_hw4_parallel_read_byte();
+        t->bad_bits |= (uint8_t)(t->read[i] ^ t->sent[i]);
+    }
+    gpio_clear(GPIOA_BASE, FPGA_HW4_SELECT_PIN);
+    gpio_clear(GPIOB_BASE, FPGA_HW4_MOSI_PIN);
+
+    for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) {
+        fpga_hw4_trigger_tail[i] = saved[i];
+    }
+    fpga_hw4_write_timing_frame(fpga_last_tuning_word, fpga_last_span);
+    fpga_hw4_scope_read_state();
+    t->done = 1u;
+}
+
+const fpga_bus_test_t *fpga_bus_test_result(void) {
+    return &fpga_hw4_bus_test;
+}
+
+// Register read-back: 16 frame bytes, then the open bitstream's capture status.
+uint8_t fpga_read_trigger_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES]) {
+    if (!status) {
+        return 0;
+    }
+
+    gpio_clear(GPIOB_BASE, FPGA_HW4_MOSI_PIN);
+    gpio_set(GPIOA_BASE, FPGA_HW4_SELECT_PIN);
+    fpga_hw4_bus_input();
+    for (uint8_t i = 0; i < 16u; ++i) {
+        (void)fpga_hw4_parallel_read_byte();
+    }
+    for (uint8_t i = 0; i < FPGA_TRIGGER_STATUS_BYTES; ++i) {
+        status[i] = fpga_hw4_parallel_read_byte();
+    }
+    gpio_clear(GPIOA_BASE, FPGA_HW4_SELECT_PIN);
+    gpio_clear(GPIOB_BASE, FPGA_HW4_MOSI_PIN);
+    return status[0] == FPGA_TRIGGER_STATUS_ID && status[6] == FPGA_TRIGGER_STATUS_VERSION ? 1u : 0u;
 }
 
 #else
@@ -519,6 +599,24 @@ uint8_t fpga_capture_read_slow_point(uint8_t sample[2]) {
 
     fpga_capture_latch();
     return 1;
+}
+
+void fpga_set_trigger_tail(const uint8_t *tail) {
+    (void)tail;
+}
+
+uint8_t fpga_read_trigger_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES]) {
+    (void)status;
+    return 0;
+}
+
+void fpga_bus_test_run(void) {
+}
+
+const fpga_bus_test_t *fpga_bus_test_result(void) {
+    static const fpga_bus_test_t none;
+
+    return &none;
 }
 
 #endif

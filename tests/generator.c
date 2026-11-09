@@ -17,6 +17,12 @@ static unsigned boot_exports;
 
 void fpga_init_once(void) {}
 uint8_t fpga_ready(void) { return 1; }
+#if FPGA_OPEN_BITSTREAM
+uint8_t fpga_read_trigger_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES]) {
+    (void)status;
+    return 0;
+}
+#endif
 void fpga_write_generator_timing(uint32_t word) {
     tuning_word = word;
     ++timing_writes;

@@ -19,8 +19,6 @@
 enum {
     SCOPE_TIMING_SETTLE_MS = 2,
     SCOPE_ANALOG_RANGE_SETTLE_MS = 2,
-    // 1US and 2US are already decimated and need no buffer+1 alignment.
-    SCOPE_FAST_ALIGN_TIMEBASE_MAX = 3,
 #if HW_TARGET_HW40
     SCOPE_HW_SLOW_TIMEBASE_START = 21,
 #else
@@ -47,6 +45,58 @@ static volatile uint8_t scope_slow_samples[SCOPE_SLOW_POINT_COUNT * 2u];
 static volatile uint16_t scope_slow_write_index;
 static volatile uint16_t scope_slow_count;
 static volatile uint16_t scope_slow_seq;
+
+#if FPGA_HW_TRIGGER && SCOPE_HW_CAPTURE
+enum {
+    SCOPE_HW_TRIGGER_HYSTERESIS = 3,
+    // Longer than the period of slow signals (a 6 Hz edge still triggers in AUTO).
+    SCOPE_HW_TRIGGER_AUTO_TIMEOUT_MS = 200,
+};
+
+static uint8_t scope_trigger_tail[FPGA_TRIGGER_TAIL_BYTES] = {0, 1, 2, 3, 4, 5, 6, 7};
+static uint8_t scope_trigger_seq;
+static uint8_t scope_trigger_dirty;
+static uint8_t scope_trigger_hit;
+static uint8_t scope_trigger_status[FPGA_TRIGGER_STATUS_BYTES];
+static uint8_t scope_trigger_status_valid;
+static uint16_t scope_trigger_pre;
+
+// A new sequence byte lets a held SINGLE capture re-arm.
+static void scope_trigger_next_seq(void) {
+    scope_trigger_dirty = 0;
+    scope_trigger_hit = 0;
+    if (scope_trigger_tail[0] != FPGA_TRIGGER_MAGIC) {
+        return;
+    }
+    ++scope_trigger_seq;
+    scope_trigger_tail[7] = scope_trigger_seq;
+    fpga_set_trigger_tail(scope_trigger_tail);
+}
+
+static void scope_trigger_read_status(void) {
+    uint8_t *status = scope_trigger_status;
+    uint16_t rot;
+    uint16_t entry;
+    uint16_t base;
+
+    scope_trigger_hit = 0;
+    scope_trigger_status_valid = fpga_read_trigger_status(status);
+    if (scope_trigger_tail[0] != FPGA_TRIGGER_MAGIC ||
+        !scope_trigger_status_valid ||
+        !(status[1] & FPGA_TRIGGER_STATUS_TRIGGERED)) {
+        return;
+    }
+    rot = (uint16_t)(((uint16_t)(status[2] & 0x0Fu) << 8) | status[3]);
+    entry = (uint16_t)(((uint16_t)(status[4] & 0x0Fu) << 8) | status[5]);
+    // Pairs start on even entries; at full rate CH1 sits on the odd entry before the pair.
+    base = (uint16_t)(entry & ~1u);
+    if ((entry & 1u) && !(status[7] & FPGA_TRIGGER_SOURCE_CH2)) {
+        base = (uint16_t)(base + 2u);
+    }
+    scope_trigger_pre = (uint16_t)(((uint16_t)(base - rot) & 0x0FFFu) >> 1);
+    scope_trigger_hit = 1;
+}
+#endif
 
 #if SCOPE_HW_CAPTURE && SCOPE_ANALOG_CONFIG
 static uint8_t scope_analog_ready;
@@ -319,6 +369,9 @@ void scope_hw_configure_channels(uint8_t timebase,
     (void)ch1_vdiv;
     (void)ch2_vdiv;
 #endif
+#if FPGA_HW_TRIGGER
+    scope_trigger_next_seq();
+#endif
     fpga_write_scope_timing(scope_span_for_timebase(timebase));
     delay_ms(SCOPE_TIMING_SETTLE_MS);
 
@@ -490,6 +543,9 @@ void scope_hw_arm(void) {
 #if SCOPE_HW_CAPTURE
     fpga_init_once();
     if (fpga_ready()) {
+#if FPGA_HW_TRIGGER
+        scope_trigger_next_seq();
+#endif
         fpga_capture_latch();
     } else {
         scope_last_status = SCOPE_STATUS_NO_FPGA;
@@ -502,6 +558,7 @@ uint8_t scope_hw_capture(uint8_t *dst, uint16_t len, uint8_t timebase) {
 #if SCOPE_HW_CAPTURE
     uint8_t *read_dst;
     uint16_t read_len;
+    uint8_t full_rate;
 
     if (!dst || len < FPGA_SCOPE_BUFFER_BYTES) {
         scope_last_status = SCOPE_STATUS_READ_ERROR;
@@ -516,6 +573,13 @@ uint8_t scope_hw_capture(uint8_t *dst, uint16_t len, uint8_t timebase) {
         return 0;
     }
     if (!fpga_capture_ready()) {
+#if FPGA_HW_TRIGGER
+        // A waiting NORM/SINGLE capture only picks up new settings when re-armed.
+        if (scope_trigger_dirty) {
+            scope_trigger_dirty = 0;
+            fpga_capture_latch();
+        }
+#endif
         scope_last_status = SCOPE_STATUS_WAIT;
         ++scope_wait_count;
         return 0;
@@ -523,7 +587,10 @@ uint8_t scope_hw_capture(uint8_t *dst, uint16_t len, uint8_t timebase) {
 
     read_dst = dst;
     read_len = FPGA_SCOPE_BUFFER_BYTES;
-    if (timebase <= SCOPE_FAST_ALIGN_TIMEBASE_MAX) {
+    // Only the undecimated span needs the buffer+1 alignment (decimated spans, e.g. 1US and
+    // 2US on stock HW4, are already pair aligned).
+    full_rate = scope_span_for_timebase(timebase) == SCOPE_HW_SPAN_MAX;
+    if (full_rate) {
         // Original firmware reads the fastest ranges into buffer+1.
         // That keeps the FPGA byte stream phase aligned for CH1/CH2 pairs.
         dst[0] = 128u;
@@ -538,10 +605,14 @@ uint8_t scope_hw_capture(uint8_t *dst, uint16_t len, uint8_t timebase) {
         ++scope_error_count;
         return 0;
     }
-    if (timebase <= SCOPE_FAST_ALIGN_TIMEBASE_MAX) {
+    if (full_rate) {
         dst[0] = dst[2];
         dst[1] = dst[3];
     }
+#if FPGA_HW_TRIGGER
+    scope_trigger_read_status();
+    scope_trigger_dirty = 0;
+#endif
     fpga_capture_latch();
     scope_last_status = SCOPE_STATUS_FRAME;
     ++scope_frame_count;
@@ -598,4 +669,97 @@ uint16_t scope_hw_error_count(void) {
 
 uint8_t scope_hw_last_status(void) {
     return scope_last_status;
+}
+
+void scope_hw_set_trigger(uint8_t enabled,
+                          uint8_t mode,
+                          uint8_t source,
+                          uint8_t falling,
+                          uint8_t level,
+                          uint16_t pre_samples) {
+#if FPGA_HW_TRIGGER && SCOPE_HW_CAPTURE
+    static const uint8_t modes[] = {
+        FPGA_TRIGGER_MODE_AUTO,
+        FPGA_TRIGGER_MODE_NORMAL,
+        FPGA_TRIGGER_MODE_SINGLE,
+    };
+    uint8_t tail[FPGA_TRIGGER_TAIL_BYTES];
+    uint8_t changed = 0;
+
+    if (enabled) {
+        if (mode >= (uint8_t)sizeof(modes)) {
+            mode = SCOPE_HW_TRIGGER_AUTO;
+        }
+        if (pre_samples > FPGA_TRIGGER_PRE_MAX) {
+            pre_samples = FPGA_TRIGGER_PRE_MAX;
+        }
+        tail[0] = FPGA_TRIGGER_MAGIC;
+        tail[1] = (uint8_t)(modes[mode] |
+                            (source ? FPGA_TRIGGER_SOURCE_CH2 : 0u) |
+                            (falling ? FPGA_TRIGGER_EDGE_FALLING : 0u));
+        tail[2] = level;
+        tail[3] = SCOPE_HW_TRIGGER_HYSTERESIS;
+        tail[4] = (uint8_t)(pre_samples >> 8);
+        tail[5] = (uint8_t)pre_samples;
+        tail[6] = SCOPE_HW_TRIGGER_AUTO_TIMEOUT_MS;
+        tail[7] = scope_trigger_seq;
+    } else {
+        for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) {
+            tail[i] = i;
+        }
+    }
+    for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES - 1u; ++i) {
+        if (tail[i] != scope_trigger_tail[i]) {
+            changed = 1;
+        }
+    }
+    if (!changed) {
+        return;
+    }
+    if (enabled) {
+        tail[7] = ++scope_trigger_seq;
+    }
+    for (uint8_t i = 0; i < FPGA_TRIGGER_TAIL_BYTES; ++i) {
+        scope_trigger_tail[i] = tail[i];
+    }
+    fpga_set_trigger_tail(scope_trigger_tail);
+    scope_trigger_dirty = 1;
+    scope_trigger_hit = 0;
+#else
+    (void)enabled;
+    (void)mode;
+    (void)source;
+    (void)falling;
+    (void)level;
+    (void)pre_samples;
+#endif
+}
+
+// Status of the last capture read (bytes 16..23 of the register read-back).
+uint8_t scope_hw_trigger_status(uint8_t status[FPGA_TRIGGER_STATUS_BYTES]) {
+#if FPGA_HW_TRIGGER && SCOPE_HW_CAPTURE
+    if (!status || !scope_trigger_status_valid) {
+        return 0;
+    }
+    for (uint8_t i = 0; i < FPGA_TRIGGER_STATUS_BYTES; ++i) {
+        status[i] = scope_trigger_status[i];
+    }
+    return 1;
+#else
+    (void)status;
+    return 0;
+#endif
+}
+
+uint8_t scope_hw_trigger_position(uint16_t *pre_samples) {
+#if FPGA_HW_TRIGGER && SCOPE_HW_CAPTURE
+    if (!pre_samples || !scope_trigger_hit) {
+        return 0;
+    }
+    *pre_samples = scope_trigger_pre;
+    return 1;
+#else
+    (void)pre_samples;
+    return 0;
+#endif
 }

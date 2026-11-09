@@ -17,6 +17,9 @@ SCOPE_ATTENUATOR_CONFIG ?= 1
 # This branch embeds the open HW4 bitstream (50 MHz, hardware trigger) in src/fpga_bitstream_hw4.c.
 FPGA_OPEN_BITSTREAM ?= $(HW_TARGET_HW40)
 FPGA_HW_TRIGGER ?= $(FPGA_OPEN_BITSTREAM)
+# FPGA_PLL=1: embed the 100 MHz open bitstream (fast clock from the FPGA PLL, like stock) from
+# src/fpga_bitstream_hw4_pll.c instead of the 50 MHz one in src/fpga_bitstream_hw4.c.
+FPGA_PLL ?= 0
 
 CLANG ?= clang
 RUST_LLD := $(shell find $(HOME)/.rustup/toolchains -path '*/bin/rust-lld' | head -1)
@@ -50,7 +53,8 @@ CFLAGS := \
 	-DSCOPE_ANALOG_CONFIG=$(SCOPE_ANALOG_CONFIG) \
 	-DSCOPE_ATTENUATOR_CONFIG=$(SCOPE_ATTENUATOR_CONFIG) \
 	-DFPGA_OPEN_BITSTREAM=$(FPGA_OPEN_BITSTREAM) \
-	-DFPGA_HW_TRIGGER=$(FPGA_HW_TRIGGER)
+	-DFPGA_HW_TRIGGER=$(FPGA_HW_TRIGGER) \
+	-DFPGA_PLL=$(FPGA_PLL)
 
 LDFLAGS := \
 	-target armv7em-none-eabi \
@@ -67,7 +71,11 @@ LDFLAGS := \
 
 SRCS := src/startup.c src/board.c src/display.c src/font.c src/dmm.c src/settings.c src/fpga.c src/scope.c src/siggen.c src/fw_update.c src/screenshot.c src/w25q.c src/usb_msc.c src/bootloader.c src/ui.c src/main.c src/fft.c src/arb_csv.c
 ifeq ($(HW_TARGET_HW40),1)
+ifeq ($(FPGA_PLL),1)
+SRCS += src/fpga_bitstream_hw4_pll.c
+else
 SRCS += src/fpga_bitstream_hw4.c
+endif
 else
 SRCS += src/fpga_bitstream.c
 endif
@@ -89,7 +97,10 @@ HOST_TEST_BINS := $(BUILD_ROOT)/tests/bootloader-old $(BUILD_ROOT)/tests/bootloa
                   $(BUILD_ROOT)/tests/generator-old $(BUILD_ROOT)/tests/generator-hw4 \
                   $(BUILD_ROOT)/tests/fpga_timing-old $(BUILD_ROOT)/tests/fpga_timing-hw4 \
                   $(BUILD_ROOT)/tests/fpga_timing-open $(BUILD_ROOT)/tests/generator-open \
-                  $(BUILD_ROOT)/tests/scope_hw_trigger-hw4 $(BUILD_ROOT)/tests/scope_hw_status-hw4
+                  $(BUILD_ROOT)/tests/scope_hw_trigger-hw4 $(BUILD_ROOT)/tests/scope_hw_status-hw4 \
+                  $(BUILD_ROOT)/tests/scope_measurements-pll $(BUILD_ROOT)/tests/fpga_timing-pll \
+                  $(BUILD_ROOT)/tests/generator-pll $(BUILD_ROOT)/tests/scope_hw_trigger-pll \
+                  $(BUILD_ROOT)/tests/scope_hw_status-pll
 
 .PHONY: all clean clean-dist release release-lt-hw4 release-hw4 test
 
@@ -117,6 +128,11 @@ test: $(HOST_TEST_BINS)
 	$(BUILD_ROOT)/tests/generator-open
 	$(BUILD_ROOT)/tests/scope_hw_trigger-hw4
 	$(BUILD_ROOT)/tests/scope_hw_status-hw4
+	$(BUILD_ROOT)/tests/scope_measurements-pll
+	$(BUILD_ROOT)/tests/fpga_timing-pll
+	$(BUILD_ROOT)/tests/generator-pll
+	$(BUILD_ROOT)/tests/scope_hw_trigger-pll
+	$(BUILD_ROOT)/tests/scope_hw_status-pll
 
 $(BUILD_ROOT)/tests/bootloader-old $(BUILD_ROOT)/tests/bootloader-hw4: tests/bootloader.c src/bootloader.c src/bootloader.h src/app_config.h
 	@mkdir -p $(dir $@)
@@ -153,6 +169,27 @@ $(BUILD_ROOT)/tests/fpga_timing-open: tests/fpga_timing.c src/fpga.c src/fpga.h 
 $(BUILD_ROOT)/tests/generator-open: tests/generator.c src/ui.c src/siggen.c src/siggen.h src/fft.c src/settings.h src/fpga.h
 	@mkdir -p $(dir $@)
 	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 $< src/siggen.c src/fft.c $(HOST_TEST_LINK) -o $@
+
+# FPGA_PLL=1 variants: open bitstream with the 100 MHz PLL fast clock
+$(BUILD_ROOT)/tests/scope_measurements-pll: tests/scope_measurements.c src/ui.c src/scope.h src/fpga.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 -DFPGA_PLL=1 $< $(HOST_TEST_LINK) -o $@
+
+$(BUILD_ROOT)/tests/fpga_timing-pll: tests/fpga_timing.c src/fpga.c src/fpga.h src/hw.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 -DFPGA_PLL=1 $< $(HOST_TEST_LINK) -o $@
+
+$(BUILD_ROOT)/tests/generator-pll: tests/generator.c src/ui.c src/siggen.c src/siggen.h src/fft.c src/settings.h src/fpga.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 -DFPGA_PLL=1 $< src/siggen.c src/fft.c $(HOST_TEST_LINK) -o $@
+
+$(BUILD_ROOT)/tests/scope_hw_trigger-pll: tests/scope_hw_trigger.c src/ui.c src/scope.h src/fpga.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 -DFPGA_HW_TRIGGER=1 -DFPGA_PLL=1 $< $(HOST_TEST_LINK) -o $@
+
+$(BUILD_ROOT)/tests/scope_hw_status-pll: tests/scope_hw_status.c src/scope.c src/scope.h src/fpga.h
+	@mkdir -p $(dir $@)
+	$(CLANG) $(HOST_TEST_FLAGS) -DHW_TARGET_HW40=1 -DFPGA_OPEN_BITSTREAM=1 -DFPGA_HW_TRIGGER=1 -DSCOPE_HW_CAPTURE=1 -DFPGA_PLL=1 $< $(HOST_TEST_LINK) -o $@
 
 $(BUILD_ROOT)/tests/dmm-old $(BUILD_ROOT)/tests/dmm-hw4: tests/dmm.c src/dmm.c src/dmm.h src/ui.c src/settings.h src/hw.h Makefile
 	@mkdir -p $(dir $@)

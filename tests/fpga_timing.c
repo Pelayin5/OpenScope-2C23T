@@ -181,7 +181,13 @@ int main(void) {
     assert(bt->bad_bits == 0x80u);
     bus_stuck_low = 0;
     transmitted_count = 0;
-    assert(FPGA_FAST_CLOCK_HZ == 50000000u);
+    assert(FPGA_FAST_CLOCK_HZ == (FPGA_PLL ? 100000000u : 50000000u));
+    // PLL meter: 262144 = 2 x 50 MHz exactly; +-2 counts still "locked"
+    assert(fpga_pll_meter_khz(FPGA_PLL_METER_NOMINAL) == 100000u);
+    assert(fpga_pll_meter_khz(262141u) == 99999u && fpga_pll_meter_khz(0) == 0);
+    assert(fpga_pll_meter_khz(131072u) == 50000u);
+    assert(fpga_pll_meter_locked(262142u) && fpga_pll_meter_locked(262146u));
+    assert(!fpga_pll_meter_locked(262141u) && !fpga_pll_meter_locked(262147u) && !fpga_pll_meter_locked(0));
 #endif
 #endif
     printf("FPGA timing: independent DDS/capture fields and hardware packet framing passed (HW4=%d)\n", HW_TARGET_HW40);

@@ -100,7 +100,7 @@ static void test_hardware_timing(void) {
         assert(scope_visible_sample_count() == visible);
         if (scope_slow_roll_active()) assert(scope_visible_sample_count() == 300u);
     }
-#if FPGA_OPEN_BITSTREAM
+#if FPGA_OPEN_BITSTREAM && !FPGA_PLL
     // Open HW4 bitstream at 50 MHz: 40 ns pairs up to 100NS, stock sample periods from 200NS.
     assert(SCOPE_HW_PAIR_NS == 40u);
     ui.scope_timebase = 0;

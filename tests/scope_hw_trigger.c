@@ -135,12 +135,13 @@ static void test_peak(void) {
     scope_acquisition = SCOPE_HW_ACQ_PEAK;
     scope_hw_trigger_sync();
     assert(hw_enabled && hw_acquisition == SCOPE_HW_ACQ_PEAK);
-    // The undecimated span already keeps every sample.
-    ui.scope_timebase = 4u;
+    // The undecimated span already keeps every sample (up to 500NS at 100 MHz, 1US at 50 MHz).
+    ui.scope_timebase = FPGA_FAST_CLOCK_HZ > 50000000u ? 3u : 4u;
     assert(scope_hw_span_for_unit_ns(scope_timebase_unit_ns_value()) == SCOPE_HW_SPAN_MAX);
     scope_hw_trigger_sync();
     assert(hw_acquisition == SCOPE_HW_ACQ_NORMAL);
-    ui.scope_timebase = 5u;
+    ui.scope_timebase++;
+    assert(scope_hw_span_for_unit_ns(scope_timebase_unit_ns_value()) < SCOPE_HW_SPAN_MAX);
     scope_hw_trigger_sync();
     assert(hw_acquisition == SCOPE_HW_ACQ_PEAK);
     // Per-sample views fall back to normal acquisition.

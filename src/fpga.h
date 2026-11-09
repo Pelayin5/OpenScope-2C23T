@@ -6,9 +6,14 @@
 #define FPGA_OPEN_BITSTREAM 0
 #endif
 
+#ifndef FPGA_PLL
+#define FPGA_PLL 0
+#endif
+
 // Fast FPGA clock: DDS step and capture entry rate at span 0x100000. Stock HW4 runs its PLL at
-// 100 MHz; the open bitstream has no PLL and runs from the 50 MHz oscillator.
-#if FPGA_OPEN_BITSTREAM
+// 100 MHz. The open bitstream runs from the 50 MHz oscillator, or with FPGA_PLL=1 from the PLL
+// at 100 MHz like stock (src/fpga_bitstream_hw4_pll.c).
+#if FPGA_OPEN_BITSTREAM && !FPGA_PLL
 #define FPGA_FAST_CLOCK_HZ 50000000u
 #else
 #define FPGA_FAST_CLOCK_HZ 100000000u
@@ -66,12 +71,31 @@ enum {
     FPGA_FEATURE_PEAK = 1u << 0,
     FPGA_FEATURE_TRIGGER_TYPES = 1u << 1,
     FPGA_FEATURE_COUNTER = 1u << 2,
+    // PLL meter: PLL output counted against the 50 MHz oscillator, window 2^22 oscillator
+    // cycles: f = count * 32 * 50 MHz / 2^22 (262144 = 100 MHz). Bytes 35..37 count (MSB
+    // first), 38 bit 0 present and bits 7..4 sequence, 39 clock mode (1 probe, 2 fast clock).
+    FPGA_FEATURE_PLL_METER = 1u << 3,
+    FPGA_EXT_STATUS_PLL_COUNT = 11,
+    FPGA_EXT_STATUS_PLL_FLAGS = 14,
+    FPGA_EXT_STATUS_CLK_MODE = 15,
+    FPGA_PLL_METER_NOMINAL = 262144u,
     // Frequency counter flags: E periods took T fast clocks (reciprocal, gate ~100 ms).
     FPGA_COUNTER_VALID = 1u << 0,
     FPGA_COUNTER_NO_SIGNAL = 1u << 1,
     FPGA_COUNTER_RUNNING = 1u << 2,
     FPGA_COUNTER_SOURCE_CH2 = 1u << 3,
 };
+
+// PLL meter count -> kHz, relative to the nominal 50 MHz oscillator (count * 3125 / 8192).
+static inline uint32_t fpga_pll_meter_khz(uint32_t count) {
+    return (uint32_t)(((uint64_t)count * 3125u + 4096u) >> 13);
+}
+
+// The open bitstream has no PLL LOCK output; "locked" = the PLL runs at exactly twice the
+// oscillator (count within +-2 of 262144, i.e. +-0.0008 MHz).
+static inline uint8_t fpga_pll_meter_locked(uint32_t count) {
+    return count + 2u >= FPGA_PLL_METER_NOMINAL && count <= FPGA_PLL_METER_NOMINAL + 2u ? 1u : 0u;
+}
 
 void fpga_init_once(void);
 uint8_t fpga_ready(void);

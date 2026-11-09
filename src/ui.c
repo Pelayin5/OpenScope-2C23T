@@ -6541,7 +6541,7 @@ static void ui_draw_scope_setup_menu(void) {
             value = scope_acquisition_labels[scope_acquisition ? 1u : 0u];
             if (scope_acquisition && !scope_peak_possible()) {
                 fg = RGB565(120, 120, 120);
-                note = "PEAK: Y-T, 2US/DIV AND SLOWER";
+                note = FPGA_FAST_CLOCK_HZ > 50000000u ? "PEAK: Y-T, 1US/DIV AND SLOWER" : "PEAK: Y-T, 2US/DIV AND SLOWER";
             }
         } else if (row == SCOPE_SETUP_TYPE) {
             label = "TRIG TYPE:";
@@ -7917,7 +7917,7 @@ static void draw_scope_fpga_diag_box(uint16_t x, uint16_t y) {
     static const char *const scope_status_names[] = {"IDLE", "NOFPGA", "WAIT", "READERR", "FRAME"};
     const uint16_t box_bg = RGB565(0, 0, 0);
     const uint16_t w = 300;
-    const uint16_t h = 114;
+    const uint16_t h = 124;
     const uint16_t tx = (uint16_t)(x + 3u);
     const fpga_bus_test_t *bt = fpga_bus_test_result();
     uint16_t ly = (uint16_t)(y + 2u);
@@ -7931,7 +7931,9 @@ static void draw_scope_fpga_diag_box(uint16_t x, uint16_t y) {
     lcd_rect(x, y, w, h, box_bg);
     lcd_frame(x, y, w, h, C_WARN);
 
-    p = scope_diag_put(line, "OPEN FPGA 50MHZ ");
+    p = scope_diag_put(line, "OPEN FPGA ");
+    p = scope_diag_put_u32(p, FPGA_FAST_CLOCK_HZ / 1000000u);
+    p = scope_diag_put(p, FPGA_PLL ? "MHZ PLL " : "MHZ ");
     p = scope_diag_put(p, FPGA_HW_TRIGGER ? "HW TRIGGER" : "CLONE (SW TRIGGER)");
     lcd_text(tx, ly, line, C_TEXT, box_bg, 1);
     ly = (uint16_t)(ly + 10u);
@@ -7953,6 +7955,34 @@ static void draw_scope_fpga_diag_box(uint16_t x, uint16_t y) {
     }
     lcd_text(tx, ly, line, bt->done && !bt->bad_bits ? C_CH2 : C_WARN, box_bg, 1);
     ly = (uint16_t)(ly + 10u);
+    // PLL meter (live): PLL frequency against the oscillator, "LOCK" = exactly 2x
+    {
+        const uint8_t *xs = scope_fpga_diag_live_ext;
+        uint8_t has = (scope_fpga_diag_live_ok & 2u) && (xs[FPGA_EXT_STATUS_FEATURES] & FPGA_FEATURE_PLL_METER);
+        uint32_t count = ((uint32_t)xs[FPGA_EXT_STATUS_PLL_COUNT] << 16) |
+                         ((uint32_t)xs[FPGA_EXT_STATUS_PLL_COUNT + 1] << 8) | xs[FPGA_EXT_STATUS_PLL_COUNT + 2];
+        uint32_t khz = fpga_pll_meter_khz(count);
+        char frac[11];
+
+        p = scope_diag_put(line, "PLL: ");
+        if (has) {
+            p = scope_diag_put_u32(p, khz / 1000u);
+            p = scope_diag_put(p, ".");
+            scope_format_u32(frac, 1000u + khz % 1000u);
+            p = scope_diag_put(p, &frac[1]);
+            p = scope_diag_put(p, " MHZ LOCK:");
+            p = scope_diag_put_u32(p, fpga_pll_meter_locked(count));
+            p = scope_diag_put(p, " N:");
+            p = scope_diag_put_u32(p, count);
+            p = scope_diag_put(p, " Q:");
+            p = scope_diag_put_u32(p, xs[FPGA_EXT_STATUS_PLL_FLAGS] >> 4);
+            p = scope_diag_put(p, xs[FPGA_EXT_STATUS_CLK_MODE] == 2u ? " CLK:PLL" : " CLK:OSC");
+        } else {
+            p = scope_diag_put(p, "- (NO METER)");
+        }
+        lcd_text(tx, ly, line, has && fpga_pll_meter_locked(count) ? C_CH2 : C_WARN, box_bg, 1);
+        ly = (uint16_t)(ly + 10u);
+    }
     p = scope_diag_put(line, "SENT:");
     p = scope_diag_put_bytes(p, &bt->sent[8], 8);
     lcd_text(tx, ly, line, C_MUTED, box_bg, 1);

@@ -13,6 +13,9 @@
 #include <stdio.h>
 #include <string.h>
 
+// fast clocks per 20 ns (1 at 50 MHz, 2 with the 100 MHz PLL bitstream)
+#define CLK_K (FPGA_FAST_CLOCK_HZ / 50000000u)
+
 static uint8_t tail[FPGA_TRIGGER_TAIL_BYTES];
 static uint8_t ext[FPGA_TRIGGER_EXT_BYTES];
 static uint8_t status[FPGA_TRIGGER_STATUS_BYTES];
@@ -142,18 +145,18 @@ static void test_counter(void) {
     uint64_t mhz = 0;
 
     ext_status[FPGA_EXT_STATUS_FEATURES] = FPGA_FEATURE_PEAK | FPGA_FEATURE_COUNTER;
-    // 55 periods in 66000 clocks of 50 MHz: 41666.666 Hz
-    set_counter(FPGA_COUNTER_VALID | FPGA_COUNTER_RUNNING, 55u, 66000u);
+    // 55 periods in 66000 clocks of 50 MHz: 41666.666 Hz (CLK_K: clocks scale with the fast clock)
+    set_counter(FPGA_COUNTER_VALID | FPGA_COUNTER_RUNNING, 55u, 66000u * CLK_K);
     capture();
     assert(scope_hw_counter_mhz(0, &mhz) && mhz == 41666666u);
     assert(!scope_hw_counter_mhz(1, &mhz));
     // 6.943 Hz: one period of 7201383 clocks
-    set_counter(FPGA_COUNTER_VALID | FPGA_COUNTER_RUNNING | FPGA_COUNTER_SOURCE_CH2, 1u, 7201383u);
+    set_counter(FPGA_COUNTER_VALID | FPGA_COUNTER_RUNNING | FPGA_COUNTER_SOURCE_CH2, 1u, 7201383u * CLK_K);
     capture();
     assert(!scope_hw_counter_mhz(0, &mhz));
     assert(scope_hw_counter_mhz(1, &mhz) && mhz == 6943u);
     // 12.5 MHz (the fastest edge rate): the quotient exceeds 32 bits
-    set_counter(FPGA_COUNTER_VALID | FPGA_COUNTER_RUNNING, 1250000u, 5000000u);
+    set_counter(FPGA_COUNTER_VALID | FPGA_COUNTER_RUNNING, 1250000u, 5000000u * CLK_K);
     capture();
     assert(scope_hw_counter_mhz(0, &mhz) && mhz == 12500000000ull);
     // no signal / running without a result / stopped: software fallback
